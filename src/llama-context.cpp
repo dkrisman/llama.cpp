@@ -1201,7 +1201,12 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
-    sched_need_reserve = true;
+    // no scheduler re-reserve here: the causal flag only changes the contents of
+    // the KQ mask inputs, not the graph topology (llama_context::encode() flips it
+    // the same way without reserving). llm_graph_params::allow_reuse() compares
+    // causal_attn, so the next decode still rebuilds the graph. mtmd toggles this
+    // flag twice per image chunk, and a full reserve costs hundreds of ms at large
+    // n_ctx, which dominated video prefill.
 }
 
 void llama_context::set_warmup(bool value) {
