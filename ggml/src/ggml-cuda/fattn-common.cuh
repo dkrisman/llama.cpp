@@ -1240,8 +1240,11 @@ void launch_fattn(
             if (l2_cache_size[id] == 0) {
                 CUDA_CHECK(cudaDeviceGetAttribute(&l2_cache_size[id], cudaDevAttrL2CacheSize, id));
             }
-            const int64_t nbytes_KV = (int64_t) ggml_row_size(K->type, K->ne[0]) * n_kv * K->ne[2] * K->ne[3] +
-                (V_is_K_view ? 0 : (int64_t) ggml_row_size(V->type, V->ne[0]) * n_kv * V->ne[2] * V->ne[3]);
+            // Size of the K/V data the kernel reads: quantized K/V that need f16 are converted to f16 before the kernel.
+            const ggml_type type_K_read = need_f16_K ? GGML_TYPE_F16 : K->type;
+            const ggml_type type_V_read = need_f16_V ? GGML_TYPE_F16 : V->type;
+            const int64_t nbytes_KV = (int64_t) ggml_row_size(type_K_read, K->ne[0]) * n_kv * K->ne[2] * K->ne[3] +
+                (V_is_K_view ? 0 : (int64_t) ggml_row_size(type_V_read, V->ne[0]) * n_kv * V->ne[2] * V->ne[3]);
 
             if (tiles_efficiency_percent >= 75 && 4*nbytes_KV > 3*int64_t(l2_cache_size[id])) {
                 use_stream_k = false;
