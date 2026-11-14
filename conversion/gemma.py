@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import MmprojModel, ModelBase, TextModel, gguf, logger
+from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf, logger
 from .qwen import DFlashModel
 
 
@@ -782,7 +782,9 @@ class Gemma4Model(Gemma3Model):
             r = self.model_tensors.pop(name)
             for e, w2 in enumerate(w2_targets):
                 s = self.model_tensors[w2]
-                self.model_tensors[w2] = lambda s=s, r=r, i=e: s() * r()[i]
+                # compressed-tensors scales come back eager (reciprocal loader) while r is
+                # lazy: materialize both before mixing
+                self.model_tensors[w2] = lambda s=s, r=r, i=e: LazyTorchTensor.to_eager(s()) * LazyTorchTensor.to_eager(r())[i]
         super()._generate_nvfp4_tensors()
 
     @classmethod
@@ -791,7 +793,9 @@ class Gemma4Model(Gemma3Model):
 
         if name.endswith("per_dim_scale") or name.endswith("layer_scalar"):
             name = name + ".weight"
-        if ".experts." in name and not name.endswith((".weight", ".weight_scale", ".weight_scale_2", ".input_scale")):
+        if ".experts." in name and not name.endswith((".weight", ".weight_scale", ".weight_scale_2", ".input_scale",
+                                                      # compressed-tensors NVFP4 names, renamed to ModelOpt later
+                                                      ".weight_packed", ".weight_global_scale", ".input_global_scale")):
             name += ".weight"
 
         return super().filter_tensors((name, gen))
