@@ -459,6 +459,11 @@ static constexpr __device__ bool ggml_cuda_fattn_mma_get_pipe(
 //     The softmax probabilities P are exchanged between the np warps through shared memory (in mma fragment layout),
 //     the KQ max is shared between them so that P and the VKQ scaling are consistent, and the partial KQ rowsums are summed at the end.
 //     P is staged in the chunk buffer of the last K chunk, which is free after the KQ calculation until the second V chunk is loaded.
+//     Tile sizes: 128 KV rows per softmax step (4 KQ tiles per warp = 8 independent HMMA chains, half the Q loads/softmax steps per KV row)
+//     in 128x32 half2 K/V chunks (16 KB, P for 128 KV rows fits exactly). The Q tile is swizzled instead of padded
+//     to make room for the larger mask tile.
+static constexpr int fattn_mma_vsplit_nbatch_fa  = 128;
+static constexpr int fattn_mma_vsplit_nbatch_KV2 = 32;
 
 static __host__ bool ggml_cuda_fattn_mma_get_vsplit(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
     return ggml_cuda_fattn_mma_get_pipe(DKQ, DV, ncols1, ncols2, cc);
@@ -809,10 +814,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
     constexpr bool vsplit          = ggml_cuda_fattn_mma_get_vsplit   (DKQ, DV, ncols1, ncols2, use_sparse, V_is_K_view);
-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
-    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = vsplit ? fattn_mma_vsplit_nbatch_fa  : ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+    constexpr int  nbatch_K2       = vsplit ? fattn_mma_vsplit_nbatch_KV2 : ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
+    constexpr int  nbatch_V2       = vsplit ? fattn_mma_vsplit_nbatch_KV2 : ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
     constexpr bool kv_f8           = std::is_same_v<T_KV2, fattn_mma_kv_f8x2>;
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse, kv_f8);
@@ -958,10 +963,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 }
             }
         } else {
-            constexpr int stride_tile_Q = DKQp/2 + 4;
+            constexpr int stride_tile_Q = vsplit ? DKQp/2 : DKQp/2 + 4;
 #pragma unroll
             for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
-                load_ldmatrix(Q_B[0], tile_Q + (threadIdx.y / np)*(T_B_KQ::I*stride_tile_Q) + k_KQ_0, stride_tile_Q);
+                if constexpr (vsplit) {
+                    load_ldmatrix_swizzled<stride_tile_Q>(Q_B[0], tile_Q, (threadIdx.y / np)*(T_B_KQ::I*stride_tile_Q) + k_KQ_0);
+                } else {
+                    load_ldmatrix(Q_B[0], tile_Q + (threadIdx.y / np)*(T_B_KQ::I*stride_tile_Q) + k_KQ_0, stride_tile_Q);
+                }
 
 #pragma unroll
                 for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
@@ -1654,10 +1663,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
     constexpr bool vsplit          = ggml_cuda_fattn_mma_get_vsplit        (DKQ, DV, ncols1, ncols2, use_sparse, V_is_K_view);
-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
-    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
+    constexpr int  nbatch_fa       = vsplit ? fattn_mma_vsplit_nbatch_fa  : ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+    constexpr int  nbatch_K2       = vsplit ? fattn_mma_vsplit_nbatch_KV2 : ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
+    constexpr int  nbatch_V2       = vsplit ? fattn_mma_vsplit_nbatch_KV2 : ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, use_sparse,
@@ -1674,7 +1683,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     static_assert(nwarps * (cols_per_warp/ncols2) % ncols1 == 0, "bad nwarps");
 
     constexpr bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols);
-    constexpr int stride_tile_Q = DKQp/2 + 4;
+    constexpr int stride_tile_Q = vsplit ? DKQp/2 : DKQp/2 + 4; // V split: swizzled Q tile.
+    static_assert(!vsplit || (DKQp == DKQ && !Q_in_reg), "bad V split Q tile");
     constexpr int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
     constexpr int stride_tile_KV_max = stride_tile_K > stride_tile_V ? stride_tile_K : stride_tile_V;
@@ -1739,14 +1749,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
                     const float2 tmp = DKQp == DKQ || k < DKQ/2 ?
                         Q_f2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k] : make_float2(0.0f, 0.0f);
-                    tile_Q[jc*stride_tile_Q + k] = scale_h2 * make_half2(tmp.x, tmp.y);
+                    tile_Q[vsplit ? swizzle<stride_tile_Q, half2>(jc*stride_tile_Q + k, jc) : jc*stride_tile_Q + k] =
+                        scale_h2 * make_half2(tmp.x, tmp.y);
                 }
             } else {
 #pragma unroll
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                    tile_Q[jc*stride_tile_Q + k] = make_half2(0.0f, 0.0f);
+                    tile_Q[vsplit ? swizzle<stride_tile_Q, half2>(jc*stride_tile_Q + k, jc) : jc*stride_tile_Q + k] = make_half2(0.0f, 0.0f);
                 }
             }
         }
@@ -2408,7 +2419,8 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols     = ncols1 * ncols2;
-    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
+    constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_vsplit(DKQ, DV, ncols1, ncols2, use_sparse, V_is_K_view) ?
+        fattn_mma_vsplit_nbatch_fa : ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
     constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
     constexpr int nwarps    = nthreads / warp_size;
 
@@ -2576,10 +2588,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     constexpr int ncols = ncols1 * ncols2;
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
     const bool vsplit         = ggml_cuda_fattn_mma_get_vsplit        (DKQ, DV, ncols1, ncols2, cc);
-    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
-    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
+    const int  nbatch_fa      = vsplit ? fattn_mma_vsplit_nbatch_fa  : ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
+    const int  nbatch_K2      = vsplit ? fattn_mma_vsplit_nbatch_KV2 : ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols, cc);
+    const int  nbatch_V2      = vsplit ? fattn_mma_vsplit_nbatch_KV2 : ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols, cc);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
     // Must match the device code: FP8 K/V is loaded synchronously, at most 1 stage (cp_async is only used for the mask).
@@ -2599,7 +2611,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(stride_tile_K,  stride_tile_V) * sizeof(half2);
     const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (stride_tile_K + stride_tile_V) * sizeof(half2);
-    const size_t nbytes_shared_Q         = ncols                * (DKQp/2 + 4)                            * sizeof(half2);
+    const size_t nbytes_shared_Q         = ncols                * (DKQp/2 + (vsplit ? 0 : 4))             * sizeof(half2);
     // V split: the KQ max per warp and Q column follows the mask.
     const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2) +
         (vsplit ? nwarps*cols_per_warp*sizeof(float) : 0);
