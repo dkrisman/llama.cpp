@@ -359,7 +359,13 @@ json server_task_result_cmpl_final::usage_json_oaicompat() {
         {"completion_tokens", n_decoded},
         {"prompt_tokens",     n_prompt_tokens},
         {"total_tokens",      n_decoded + n_prompt_tokens},
-        {"prompt_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
+        // created_cache_tokens (vLLM field): prompt tokens processed this
+        // request and kept in the slot cache for reuse -> Anthropic-style
+        // cache_creation_input_tokens downstream
+        {"prompt_tokens_details", json {
+            {"cached_tokens",        n_prompt_tokens_cache},
+            {"created_cache_tokens", std::max(0, n_prompt_tokens - n_prompt_tokens_cache)},
+        }},
     };
 }
 

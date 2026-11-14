@@ -6399,6 +6399,30 @@ void server_routes::init_routes() {
         auto res = create_response();
         const json body = json::parse(req.body);
         json tokens_response = json::array();
+        if (body.count("messages") != 0 && body.count("content") == 0) {
+            // vLLM-style chat tokenize ({messages, tools, add_generation_prompt}
+            // -> {count, tokens}), used by OpenAI-compatible proxies for
+            // server-side prompt token counting: render the chat template like
+            // /apply-template, then count like /v1/messages/count_tokens
+            std::vector<raw_buffer> files;
+            common_chat_session session; // dummy, unused
+            json chat_body = body;
+            json parsed = oaicompat_chat_params_parse(ctx_server.vocab, chat_body, meta->chat_params, files, session);
+            const json & prompt = parsed.at("prompt");
+            json out;
+            if (ctx_server.mctx != nullptr) {
+                if (!prompt.is_string()) {
+                    throw std::runtime_error("for mtmd, input prompt must be a string.");
+                }
+                out["count"] = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt, true).size();
+            } else {
+                llama_tokens tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true);
+                out["count"] = tokens.size();
+                out["tokens"] = std::move(tokens);
+            }
+            res->ok(out);
+            return res;
+        }
         if (body.count("content") != 0) {
             const bool add_special = json_value(body, "add_special", false);
             const bool parse_special = json_value(body, "parse_special", true);
