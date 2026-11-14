@@ -462,15 +462,11 @@ static constexpr __device__ bool ggml_cuda_fattn_mma_get_pipe(
 //     Tile sizes: 128 KV rows per softmax step (4 KQ tiles per warp = 8 independent HMMA chains, half the Q loads/softmax steps per KV row)
 //     in 128x32 half2 K/V chunks (16 KB, P for 128 KV rows fits exactly). The Q tile is swizzled instead of padded
 //     to make room for the larger mask tile.
-#ifndef GGML_CUDA_FA_VSPLIT_NBATCH_FA
-#define GGML_CUDA_FA_VSPLIT_NBATCH_FA 128
-#endif
-static constexpr int fattn_mma_vsplit_nbatch_fa  = GGML_CUDA_FA_VSPLIT_NBATCH_FA;
+static constexpr int fattn_mma_vsplit_nbatch_fa  = 128;
 static constexpr int fattn_mma_vsplit_nbatch_KV2 = 32;
-#ifndef GGML_CUDA_FA_VSPLIT_NWARPS
-#define GGML_CUDA_FA_VSPLIT_NWARPS 8
-#endif
-static constexpr int fattn_mma_vsplit_nthreads   = 32*GGML_CUDA_FA_VSPLIT_NWARPS;
+// 8 warps (np == 2). 16 warps (np == 4, 128 registers) were measured slower: kv 34816 f16 15911 us, f8 14768 us (spills),
+//     with nbatch_fa 64 18430/15675 us (2x the Q fragment loads).
+static constexpr int fattn_mma_vsplit_nthreads   = 256;
 
 static __host__ bool ggml_cuda_fattn_mma_get_vsplit(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
     return ggml_cuda_fattn_mma_get_pipe(DKQ, DV, ncols1, ncols2, cc);
@@ -890,11 +886,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     pipe_stage_t stage_v0; // V split: staging of the second V chunk, its load is started before the V loop.
     GGML_UNUSED_VARS(tile_P, tile_max, stage_v0);
 
-#ifndef GGML_CUDA_FA_VSPLIT_KQ2
-#define GGML_CUDA_FA_VSPLIT_KQ2 0
-#endif
-    // V split: 2 independent KQ accumulators (even/odd k steps) for twice as many independent HMMA chains.
-    constexpr bool kq2 = vsplit && GGML_CUDA_FA_VSPLIT_KQ2 && !Q_in_reg;
 #if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -902,8 +893,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #else // Volta
     T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
 #endif // defined(TURING_MMA_AVAILABLE)
-    T_C_KQ KQ_C2[kq2 ? nbatch_fa/(np*T_C_KQ::J) : 1];
-    GGML_UNUSED(KQ_C2);
 
     if constexpr (nstages > 1) {
         static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
@@ -1007,15 +996,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[0]);
 #else
                         // swap A and B for CUDA.
-                        if constexpr (kq2) {
-                            if ((k_KQ_0/T_A_KQ::J) % 2 == 1) {
-                                mma(KQ_C2[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
-                            } else {
-                                mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
-                            }
-                        } else {
-                            mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
-                        }
+                        mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
                     }
                 }
@@ -1029,16 +1010,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             __syncthreads(); // Only needed if tile_K == tile_V.
         }
         GGML_UNUSED_VARS(stage, tile_KV_nxt);
-    }
-
-    if constexpr (kq2) {
-#pragma unroll
-        for (int i = 0; i < nbatch_fa/(np*T_C_KQ::J); ++i) {
-#pragma unroll
-            for (int l = 0; l < T_C_KQ::ne; ++l) {
-                KQ_C[i].x[l] += KQ_C2[i].x[l];
-            }
-        }
     }
 
     if (use_logit_softcap) {
