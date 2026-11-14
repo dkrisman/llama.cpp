@@ -77,6 +77,26 @@ def test_reasoning(template_name: str, reasoning: Literal['on', 'off', 'auto'] |
     assert prompt.endswith(expected_end), f"Expected prompt to end with '{expected_end}', got '{prompt}'"
 
 
+@pytest.mark.parametrize("reasoning", ["on", "auto"])
+def test_reasoning_effort_none_overrides_server_default(reasoning: Literal['on', 'auto']):
+    global server
+    server.jinja = True
+    server.reasoning = reasoning
+    server.chat_template_file = '../../../models/templates/deepseek-ai-DeepSeek-R1-Distill-Qwen-32B.jinja'
+    server.start()
+
+    res = server.make_request("POST", "/apply-template", data={
+        "messages": [
+            {"role": "user", "content": "What is today?"},
+        ],
+        "reasoning_effort": "none",
+    })
+    assert res.status_code == 200
+    prompt = res.body["prompt"]
+
+    assert prompt.endswith("<think>\n</think>"), f"Expected thinking disabled, got '{prompt}'"
+
+
 @pytest.mark.parametrize("tools", [None, [], [TEST_TOOL]])
 @pytest.mark.parametrize("template_name,format", [
     ("meta-llama-Llama-3.3-70B-Instruct",    "%d %b %Y"),

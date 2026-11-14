@@ -1643,6 +1643,8 @@ json oaicompat_chat_params_parse(
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
+            // the template reads enable_thinking from the kwargs, which may carry the --reasoning on default
+            inputs.chat_template_kwargs["enable_thinking"] = "false";
             inputs.chat_template_kwargs.erase("reasoning_effort");
         } else if (!reasoning_effort.empty()) {
             const auto rejected = caps.at("reasoning_effort_rejected").get<std::vector<std::string>>();
