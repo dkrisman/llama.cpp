@@ -464,6 +464,10 @@ static constexpr __device__ bool ggml_cuda_fattn_mma_get_pipe(
 //     to make room for the larger mask tile.
 static constexpr int fattn_mma_vsplit_nbatch_fa  = 128;
 static constexpr int fattn_mma_vsplit_nbatch_KV2 = 32;
+#ifndef GGML_CUDA_FA_VSPLIT_NWARPS
+#define GGML_CUDA_FA_VSPLIT_NWARPS 8
+#endif
+static constexpr int fattn_mma_vsplit_nthreads   = 32*GGML_CUDA_FA_VSPLIT_NWARPS;
 
 static __host__ bool ggml_cuda_fattn_mma_get_vsplit(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
     return ggml_cuda_fattn_mma_get_pipe(DKQ, DV, ncols1, ncols2, cc);
@@ -472,6 +476,12 @@ static __host__ bool ggml_cuda_fattn_mma_get_vsplit(const int DKQ, const int DV,
 static constexpr __device__ bool ggml_cuda_fattn_mma_get_vsplit(
         const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse, const bool V_is_K_view) {
     return ggml_cuda_fattn_mma_get_pipe(DKQ, DV, ncols1, ncols2, use_sparse, V_is_K_view);
+}
+
+static constexpr __device__ int ggml_cuda_fattn_mma_get_nthreads_k(
+        const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse, const bool V_is_K_view) {
+    return ggml_cuda_fattn_mma_get_vsplit(DKQ, DV, ncols1, ncols2, use_sparse, V_is_K_view) ?
+        fattn_mma_vsplit_nthreads : ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2);
 }
 
 // Named barrier for the np warps that share Q columns (barrier 0 is __syncthreads).
@@ -871,7 +881,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // V split: P tiles in mma fragment layout (16 bytes per thread and 16x16 tile) in the chunk buffer of the last K chunk
     //     (which is also the buffer of the second V chunk), the KQ max per warp and Q column after the mask.
     half2 * const tile_P   = (nchunks_K - 1) % 2 == 1 ? tile_V : tile_K;
-    float * const tile_max = (float *) (tile_mask + ncols1*(nbatch_fa + 8));
+    half  * const tile_max = tile_mask + ncols1*(nbatch_fa + 8); // As half (rounded up) to fit 16 warps.
     static_assert(!vsplit || ncols*(nbatch_fa/2) <= nbatch_fa*stride_tile_V, "P does not fit into a chunk buffer");
     pipe_stage_t stage_v0; // V split: staging of the second V chunk, its load is started before the V loop.
     GGML_UNUSED_VARS(tile_P, tile_max, stage_v0);
@@ -1180,19 +1190,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             // Share the KQ max between the np warps of the Q columns, the __syncthreads is the one for the first V chunk.
             // Thread column l/2 % 2 == col is Q column col*8 + threadIdx.x/4 of the warp.
             if (threadIdx.x % 4 == 0) {
-                tile_max[threadIdx.y*cols_per_warp + 0 + threadIdx.x/4] = KQ_max_new[0];
-                tile_max[threadIdx.y*cols_per_warp + 8 + threadIdx.x/4] = KQ_max_new[1];
+                tile_max[threadIdx.y*cols_per_warp + 0 + threadIdx.x/4] = __float2half_ru(KQ_max_new[0]);
+                tile_max[threadIdx.y*cols_per_warp + 8 + threadIdx.x/4] = __float2half_ru(KQ_max_new[1]);
             }
             // All warps are also done with the last K chunk, its buffer can be used for P.
             __syncthreads();
             if constexpr (kv_f8) { // Registers only, the store into the chunk buffer is after the first V chunk.
                 pipe_load_chunk(stage_v0, V_h2 + nbatch_V2, stride_V, k_VKQ_0, tile_P);
             }
+            // All np warps (including this one) use the same rounded values -> identical KQ max.
             const int w0 = threadIdx.y - threadIdx.y % np;
+            KQ_max_new[0] = -INFINITY;
+            KQ_max_new[1] = -INFINITY;
 #pragma unroll
             for (int ip = 0; ip < np; ++ip) {
-                KQ_max_new[0] = fmaxf(KQ_max_new[0], tile_max[(w0 + ip)*cols_per_warp + 0 + threadIdx.x/4]);
-                KQ_max_new[1] = fmaxf(KQ_max_new[1], tile_max[(w0 + ip)*cols_per_warp + 8 + threadIdx.x/4]);
+                KQ_max_new[0] = fmaxf(KQ_max_new[0], __half2float(tile_max[(w0 + ip)*cols_per_warp + 0 + threadIdx.x/4]));
+                KQ_max_new[1] = fmaxf(KQ_max_new[1], __half2float(tile_max[(w0 + ip)*cols_per_warp + 8 + threadIdx.x/4]));
             }
         }
 
@@ -1995,7 +2008,38 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int tile_stride = nbatch_combine + 4;
     static_assert((DVp/2) % nbatch_combine == 0, "bad nbatch_combine");
 
-    if constexpr (cols_per_warp == 8) {
+    // V split: the KQ max is the same for the np warps of the Q columns, only the partial rowsums need to be summed.
+    //     The VKQ data and meta data use a single row per Q column (np_c == 1 below).
+    constexpr int np_c = vsplit ? 1 : np;
+
+    if constexpr (vsplit) {
+        static_assert(ncols*tile_stride + nwarps*cols_per_warp <= ncols*stride_tile_Q, "bad V split combine");
+        float * const tile_rowsum = (float *) (tile_Q + ncols*tile_stride); // Behind the VKQ rows of the combine tile.
+        // Thread column col is Q column col*8 + threadIdx.x/4 of the warp.
+        if (threadIdx.x % 4 == 0) {
+            tile_rowsum[threadIdx.y*cols_per_warp + 0 + threadIdx.x/4] = KQ_rowsum[0];
+            tile_rowsum[threadIdx.y*cols_per_warp + 8 + threadIdx.x/4] = KQ_rowsum[1];
+        }
+        __syncthreads();
+        if (threadIdx.y % np == 0 && threadIdx.x % 4 < cols_per_thread) {
+            const int col = threadIdx.x % 4;
+            const int c   = col*8 + threadIdx.x/4;
+            float rowsum = 0.0f;
+#pragma unroll
+            for (int ip = 0; ip < np; ++ip) {
+                rowsum += tile_rowsum[(threadIdx.y + ip)*cols_per_warp + c];
+            }
+            const int    jc     = (threadIdx.y/np)*cols_per_warp + c;
+            const float2 KQ_cmr = make_float2(KQ_max[col], rowsum);
+            ((float2 *) tile_Q)[jc*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
+            if (needs_fixup) {
+                dstk_fixup[blockIdx.x*ncols + jc] = KQ_cmr;
+            }
+            if (is_fixup) {
+                dstk_fixup[(gridDim.x + blockIdx.x)*ncols + jc] = KQ_cmr;
+            }
+        }
+    } else if constexpr (cols_per_warp == 8) {
         const int jc_cwmo = (threadIdx.x % (2*T_C_VKQ::J)) / T_C_VKQ::J; // jc combine write meta offset
         const int jc_cwm = threadIdx.y*(2*T_C_VKQ::J) + 2*T_C_VKQ::get_j(-1) + jc_cwmo; // jc combine write meta
         const float2 KQ_cmr = make_float2(KQ_max[jc_cwmo], KQ_rowsum[jc_cwmo]); // KQ combine max rowsum
@@ -2063,7 +2107,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
     }
 
-    if (np > 1) {
+    if (!vsplit && np > 1) {
         constexpr int nmeta = np*cols_per_warp >= warp_size ? np*cols_per_warp/warp_size : 1;
 
         float KQ_cmn;
@@ -2160,7 +2204,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 static_assert(T_C_VKQ::dl == DATA_LAYOUT_I_MAJOR && nbatch_combine % nbatch_V2 == 0, "bad V split combine");
                 constexpr int nbatch_V2_w = nbatch_V2/np;
                 constexpr int ntiles_V_w  = nbatch_V2_w/T_C_VKQ::J;
-                const int j0_vs = (threadIdx.y/np)*(np*cols_per_warp);
+                const int j0_vs = (threadIdx.y/np)*cols_per_warp;
                 const int k_w   = (threadIdx.y % np)*nbatch_V2_w;
 #pragma unroll
                 for (int c = k00/nbatch_V2; c < (k00 + nbatch_combine)/nbatch_V2; ++c) {
@@ -2220,7 +2264,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
         __syncthreads();
 
-        if (np == 1 || threadIdx.y % np == 0) {
+        if (np_c == 1 || threadIdx.y % np_c == 0) {
             // The first 2*2*gridDim.x*ncols floats in dstk_fixup are for storing max. values and row sums.
             // The values after that are for the partial results of the individual blocks.
             float2 * dstk_fixup_data = dstk_fixup + gridDim.x*(2*ncols) + blockIdx.x*(ncols*(DV/2));
@@ -2236,14 +2280,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
 
 #pragma unroll
-                for (int jc0_dst = 0; jc0_dst < ncols; jc0_dst += (nwarps/np)*stride_jc) {
-                    const int jc_dst = jc0_dst + (threadIdx.y/np)*stride_jc + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+                for (int jc0_dst = 0; jc0_dst < ncols; jc0_dst += (nwarps/np_c)*stride_jc) {
+                    const int jc_dst = jc0_dst + (threadIdx.y/np_c)*stride_jc + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
 
-                    if (jc0_dst + (nwarps/np)*stride_jc > ncols && jc_dst >= ncols) {
+                    if (jc0_dst + (nwarps/np_c)*stride_jc > ncols && jc_dst >= ncols) {
                         break;
                     }
 
-                    const int jc_tile_K = (jc_dst/cols_per_warp)*(np*cols_per_warp) + jc_dst % cols_per_warp;
+                    const int jc_tile_K = (jc_dst/cols_per_warp)*(np_c*cols_per_warp) + jc_dst % cols_per_warp;
 
                     const int j_dst = jc_dst / ncols2;
                     const int c_dst = jc_dst % ncols2;
@@ -2263,8 +2307,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
                         float2 dstk_val = make_float2(0.0f, 0.0f);
 #pragma unroll
-                        for (int ip = 0; ip < (vsplit ? 1 : np); ++ip) {
-                            const float KQ_crs = np == 1 ? 1.0f : meta_j[ip*cols_per_warp * tile_stride + 0];
+                        for (int ip = 0; ip < np_c; ++ip) {
+                            const float KQ_crs = np_c == 1 ? 1.0f : meta_j[ip*cols_per_warp * tile_stride + 0];
                             const float2 dstk_val_add = __half22float2(tile_Q[(jc_tile_K + ip*cols_per_warp) * tile_stride + k]);
                             dstk_val.x += dstk_val_add.x*KQ_crs;
                             dstk_val.y += dstk_val_add.y*KQ_crs;
@@ -2308,7 +2352,8 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
 
 // kv_f8: K and V are FP8 E4M3 (GGML_TYPE_F8_E4M3) and are converted to f16 while loading them into shared memory.
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool kv_f8>
-__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
+__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads_k(DKQ, DV, ncols1, ncols2, use_sparse, V_is_K_view),
+    ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_ext_f16(
         const char * Q_ptr,
         const char * K_ptr,
@@ -2391,7 +2436,7 @@ static __global__ void flash_attn_ext_f16(
     constexpr int ncols     = ncols1 * ncols2;
     constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_vsplit(DKQ, DV, ncols1, ncols2, use_sparse, V_is_K_view) ?
         fattn_mma_vsplit_nbatch_fa : ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
-    constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
+    constexpr int nthreads  = ggml_cuda_fattn_mma_get_nthreads_k(DKQ, DV, ncols1, ncols2, use_sparse, V_is_K_view);
     constexpr int nwarps    = nthreads / warp_size;
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
@@ -2539,7 +2584,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     constexpr int ncols = ncols1 * ncols2;
 
-    const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
+    const int  nthreads       = ggml_cuda_fattn_mma_get_vsplit(DKQ, DV, ncols1, ncols2, cc) ?
+        fattn_mma_vsplit_nthreads : ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
     const bool vsplit         = ggml_cuda_fattn_mma_get_vsplit        (DKQ, DV, ncols1, ncols2, cc);
     const int  nbatch_fa      = vsplit ? fattn_mma_vsplit_nbatch_fa  : ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
     const int  nbatch_K2      = vsplit ? fattn_mma_vsplit_nbatch_KV2 : ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols, cc);
@@ -2566,8 +2612,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const size_t nbytes_shared_Q         = ncols                * (DKQp/2 + (vsplit ? 0 : 4))             * sizeof(half2);
     // V split: the KQ max per warp and Q column follows the mask.
     const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2) +
-        (vsplit ? nwarps*cols_per_warp*sizeof(float) : 0);
-    const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
+        (vsplit ? nwarps*cols_per_warp*sizeof(half) : 0);
+    // V split: one combine row per Q column + the partial rowsums, see flash_attn_ext_f16_process_tile.
+    const size_t nbytes_shared_combine   = vsplit ? (ncols*(nbatch_combine + 4) + nwarps*cols_per_warp)   * sizeof(half2) :
+                                           nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
 
     const bool   pipe             = ggml_cuda_fattn_mma_get_pipe(DKQ, DV, ncols1, ncols2, cc);
     const size_t nbytes_shared_KV = nstages <= 1 && !pipe ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
