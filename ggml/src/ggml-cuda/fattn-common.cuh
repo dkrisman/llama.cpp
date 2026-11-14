@@ -1225,7 +1225,28 @@ void launch_fattn(
         };
 
         const int  max_blocks   = max_blocks_per_sm*nsm;
-        const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
+        bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
+
+        // Blackwell sm_12x, head size 512 (e.g. Gemma 4 global attention prefill): with Stream-K the concurrently running blocks
+        //     start at different KV offsets and read the whole K/V working set at the same time.
+        //     If that does not fit into L2 whole tiles are faster: concurrent blocks then stream through K/V in lockstep.
+        //     RTX PRO 6000 (128 MB L2), ubatch 2048, GQA 8: f16 K/V -9% at 32K depth, f16/FP8 K/V -28%/-14% at 112K depth.
+        //     FP8 K/V at 32K depth (71 MB) fits into L2 and is 5% faster with Stream-K, hence the size threshold.
+        if (use_stream_k && DV == 512 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN) {
+            const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
+            const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
+
+            static int l2_cache_size[GGML_CUDA_MAX_DEVICES] = {0};
+            if (l2_cache_size[id] == 0) {
+                CUDA_CHECK(cudaDeviceGetAttribute(&l2_cache_size[id], cudaDevAttrL2CacheSize, id));
+            }
+            const int64_t nbytes_KV = (int64_t) ggml_row_size(K->type, K->ne[0]) * n_kv * K->ne[2] * K->ne[3] +
+                (V_is_K_view ? 0 : (int64_t) ggml_row_size(V->type, V->ne[0]) * n_kv * V->ne[2] * V->ne[3]);
+
+            if (tiles_efficiency_percent >= 75 && 4*nbytes_KV > 3*int64_t(l2_cache_size[id])) {
+                use_stream_k = false;
+            }
+        }
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;

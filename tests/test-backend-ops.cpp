@@ -14013,6 +14013,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 34816,    1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1},  3328, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
     }
+    // Same global-layer prefill shape at ~112K depth (114688 + ubatch 2048)
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 116736, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+    }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
