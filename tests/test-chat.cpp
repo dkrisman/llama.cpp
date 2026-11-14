@@ -4918,6 +4918,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             bool got_runtime_error = false;
             bool got_out_of_range = false;
             std::string error_msg;
+            setenv("LLAMA_CHAT_PARSE_STRICT", "1", 1);
             try {
                 common_chat_peg_parse(arena, common_chat_input(bad_input), /*is_partial=*/false, pp);
             } catch (const std::out_of_range & e) {
@@ -4927,8 +4928,13 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 got_runtime_error = true;
                 error_msg = e.what();
             }
+            unsetenv("LLAMA_CHAT_PARSE_STRICT");
             GGML_ASSERT(!got_out_of_range && "throw path crashed with out_of_range (input.substr in effective_input space)");
             GGML_ASSERT(got_runtime_error  && "throw path should produce std::runtime_error with parse position");
+
+            // default (non-strict): the same output is returned, unparsed tail as content, no throw
+            common_chat_msg salvaged = common_chat_peg_parse(arena, common_chat_input(bad_input), /*is_partial=*/false, pp);
+            GGML_ASSERT(salvaged.content.find("get_weather") != std::string::npos && "salvaged output keeps the unparsed tail");
         }
     }
 

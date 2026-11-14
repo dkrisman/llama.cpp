@@ -1821,7 +1821,14 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     common_peg_parse_context ctx(std::move(effective_input.text), std::move(effective_input.tokens), flags);
     auto result = parser.parse(ctx);
 
-    if (result.fail()) {
+    // Final output that does not match the format grammar (e.g. degenerate deep-context generations) is returned
+    // like vLLM does instead of failing the whole request with a 500: whatever parsed is mapped as usual and the
+    // unparsed tail is appended to the content. LLAMA_CHAT_PARSE_STRICT=1 restores the error.
+    const char * strict_env  = getenv("LLAMA_CHAT_PARSE_STRICT");
+    const bool   parse_strict = strict_env != nullptr && std::string(strict_env) == "1";
+    const bool salvage = result.fail() && !is_partial && !parse_strict;
+
+    if (result.fail() && !salvage) {
         // During partial parsing, return partial results if any AST nodes were captured
         // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
         if (is_partial && result.end > 0) {
@@ -1861,6 +1868,15 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
         mapper = std::make_unique<common_chat_peg_mapper>(msg);
     }
     mapper->from_ast(ctx.ast, result);
+
+    if (salvage) {
+        // the parse position counts the prepended generation prompt, which is not model output
+        const size_t tail_start = std::max<size_t>(result.end, params.generation_prompt.size());
+        const std::string tail = tail_start < ctx.input.size() ? ctx.input.substr(tail_start) : std::string();
+        LOG_WRN("%s: %s output does not match the format, returning %zu unparsed bytes as content\n",
+                __func__, common_chat_format_name(params.format), tail.size());
+        msg.content += tail;
+    }
 
     if (ctx.is_debug()) {
         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
