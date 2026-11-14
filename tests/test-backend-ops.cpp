@@ -13140,6 +13140,49 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // FP8 E4M3 K/V for batch sizes that use the CUDA MMA kernel, which reads FP8 K/V natively for head sizes 64/128/256/512:
+    {
+        const ggml_type f8 = GGML_TYPE_F8_E4M3;
+        for (int hs : {64, 128, 256, 512}) {
+            for (int nr2 : {1, 2, 4, 8}) {
+                if (hs == 512 && nr2 == 1) continue; // head size 512 requires the GQA optimization
+                for (int nb : {1, 8, 32, 75}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, 512, nb, true, false, 0, 0, GGML_PREC_F32, f8, f8));
+                }
+                // long KV, prompt-sized batches
+                for (int nb : {64, 512}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 1, {nr2, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, f8, f8));
+                }
+            }
+            const int nr2 = hs == 512 ? 2 : 1;
+            // permuted K/V, sinks, K/V not a view, decode with long KV
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4,   1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, f8, f8, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4,   1}, 1024, 75, true, true,  0, 0, GGML_PREC_F32, f8, f8));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, 1024, 48, true, false, 0, 0, GGML_PREC_F32, f8, f8, {0, 1, 2, 3}, false));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 1, {8,   1}, 8192,  1, true, false, 0, 0, GGML_PREC_F32, f8, f8));
+            if (hs != 512) {
+                // KV length not a multiple of the tile size, ALiBi, no mask: kernels without GQA optimization + OOB checks
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1}, 4097, 33, true,  false, 0,    0, GGML_PREC_F32, f8, f8));
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1},  777, 75, true,  false, 8.0f, 0, GGML_PREC_F32, f8, f8));
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {1, 1},  512, 75, false, false, 0,    0, GGML_PREC_F32, f8, f8));
+                // 2 sequences (broadcast in dim 3)
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {2, 2},  512, 32, true,  false, 0,    0, GGML_PREC_F32, f8, f8));
+            }
+        }
+        // logit softcap (head size 256: Gemma 2 style)
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 1024, 75, true, false, 0, 30.0f, GGML_PREC_F32, f8, f8));
+        // sparse mask hint (sparse gather kernels)
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, f8, f8, {0, 1, 2, 3}, true, false,  512));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, f8, f8, {0, 1, 2, 3}, true, false,  512));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, f8, f8, {0, 1, 2, 3}, true, false,  512));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, f8, f8, {0, 1, 2, 3}, true, false, 2048));
+        // mixed FP8/F16 K/V and head sizes without native FP8 MMA instances keep converting K/V to f16
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, f8, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, f8));
+        test_cases.emplace_back(new test_flash_attn_ext( 80,  80, 2, {4, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, f8, f8));
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, f8, f8, {0, 1, 2, 3}, true, true));
+    }
+
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
@@ -13187,6 +13230,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 4, 2, 3000, 768,  nb, n_slices, GGML_TYPE_Q8_0));
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(512, 2, 8, 4096, 1024, nb, n_slices));
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1280, nb, n_slices));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 4096, 1024, nb, n_slices, GGML_TYPE_F8_E4M3));
+            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(512, 2, 8, 4096, 1024, nb, n_slices, GGML_TYPE_F8_E4M3));
         }
     }
 
@@ -13960,6 +14005,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
+    }
+
+    // Gemma 4 26B-A4B prefill (ubatch 2048): global layers (512, 2 KV heads, GQA 8) at 32K depth and SWA layers (256, 8 KV heads, GQA 2)
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_F8_E4M3}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 34816, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 34816,    1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1},  3328, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
