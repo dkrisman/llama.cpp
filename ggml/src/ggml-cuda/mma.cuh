@@ -1013,6 +1013,28 @@ namespace ggml_cuda_mma {
 #endif // VOLTA_MMA_AVAILABLE
     }
 
+    // Same result as load_ldmatrix_swizzled for a 16x8 tile, but the 4 8x8 matrices are loaded in the order 0, 2, 1, 3
+    //     so that they end up in the physical registers in that order:
+    //     when the tile is used as the B operand of a 16x16 mma the B fragments of both 8-column halves (x[0], x[2]) and (x[1], x[3])
+    //     are then consecutive register pairs and the compiler does not need register moves before the mma instructions.
+    template <int stride, typename T>
+    static __device__ __forceinline__ void load_ldmatrix_swizzled_bpair(
+            tile<16, 8, T, DATA_LAYOUT_I_MAJOR> & t, const T * __restrict__ xs0, const int offset) {
+#if defined(TURING_MMA_AVAILABLE)
+        const int i = (threadIdx.x / 16) * 8 + threadIdx.x % 8;
+        const int j = ((threadIdx.x / 8) % 2) * (t.J / 2);
+        int offset_ij = offset + i * stride + j;
+        offset_ij = swizzle<stride, T>(offset_ij, i);
+        int * xi = (int *) t.x;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
+            : "l"(xs0 + offset_ij));
+#else
+        GGML_UNUSED_VARS(t, xs0, offset);
+        NO_DEVICE_CODE;
+#endif // defined(TURING_MMA_AVAILABLE)
+    }
+
     template <int stride, int I, typename T, data_layout dl>
     static __device__ __forceinline__ void load_ldmatrix_trans_swizzled(
             tile<I, 8, T, dl> & t, const T * __restrict__ xs0, const int offset) {

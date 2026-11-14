@@ -462,7 +462,10 @@ static constexpr __device__ bool ggml_cuda_fattn_mma_get_pipe(
 //     Tile sizes: 128 KV rows per softmax step (4 KQ tiles per warp = 8 independent HMMA chains, half the Q loads/softmax steps per KV row)
 //     in 128x32 half2 K/V chunks (16 KB, P for 128 KV rows fits exactly). The Q tile is swizzled instead of padded
 //     to make room for the larger mask tile.
-static constexpr int fattn_mma_vsplit_nbatch_fa  = 128;
+#ifndef GGML_CUDA_FA_VSPLIT_NBATCH_FA
+#define GGML_CUDA_FA_VSPLIT_NBATCH_FA 128
+#endif
+static constexpr int fattn_mma_vsplit_nbatch_fa  = GGML_CUDA_FA_VSPLIT_NBATCH_FA;
 static constexpr int fattn_mma_vsplit_nbatch_KV2 = 32;
 #ifndef GGML_CUDA_FA_VSPLIT_NWARPS
 #define GGML_CUDA_FA_VSPLIT_NWARPS 8
@@ -987,7 +990,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int i_KQ_0 = i_KQ_00 + (threadIdx.y % np)*T_A_KQ::I;
 
                     T_A_KQ K_A;
-                    load_ldmatrix_swizzled<stride_tile_K>(K_A, tile_K_cur, i_KQ_0*stride_tile_K + k_KQ_0-k0_start);
+                    // K_A is the B operand of the mma below, f16 K/V only: for FP8 K/V the different register allocation
+                    //     made the kernel slower (13011 -> 13381 us at kv 34816), f16: 15392 -> 15099 us.
+                    if constexpr (vsplit && !kv_f8) {
+                        load_ldmatrix_swizzled_bpair<stride_tile_K>(K_A, tile_K_cur, i_KQ_0*stride_tile_K + k_KQ_0-k0_start);
+                    } else {
+                        load_ldmatrix_swizzled<stride_tile_K>(K_A, tile_K_cur, i_KQ_0*stride_tile_K + k_KQ_0-k0_start);
+                    }
 
                     if constexpr (cols_per_warp == 8) {
                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[0]);
