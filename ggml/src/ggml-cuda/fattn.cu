@@ -612,6 +612,8 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(BF16, F8_E4M3)
     FATTN_VEC_CASES_ALL_D(F8_E4M3, F8_E4M3)
 
+    FATTN_VEC_CASES_ALL_D(NVFP4, NVFP4)
+
     return nullptr;
 }
 
@@ -780,7 +782,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc)) {
-        // The vector kernel has no NVFP4 K/V instances, the MMA kernel reads NVFP4 natively also for small batches:
+        // NVFP4: the MMA kernel reads it natively and is faster than the vector kernel also for small batches
+        //     (D=256 GQA 2 kv 2048: nb 1 vector 18.7 us, MMA nb 4 8.9 us; fp8 vector nb 1 10.6 us).
         if (ggml_cuda_fattn_mma_kv_native_fmt(cc, dst) == FATTN_MMA_KV_NVFP4) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
