@@ -235,9 +235,10 @@ static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, bl
             for (int h = 0; h < 2; ++h) {
                 const float v = xb[h*(QK_NVFP4_SUB/2) + j];
                 int   best_i   = 0;
-                float best_err = fabsf(kvalues_mxfp4[0]*d - v);
+                // __fmul_rn: no FMA contraction, ties must break like on the CPU
+                float best_err = fabsf(__fmul_rn(kvalues_mxfp4[0], d) - v);
                 for (int i = 1; i < 16; ++i) {
-                    const float err = fabsf(kvalues_mxfp4[i]*d - v);
+                    const float err = fabsf(__fmul_rn(kvalues_mxfp4[i], d) - v);
                     if (err < best_err) {
                         best_i   = i;
                         best_err = err;

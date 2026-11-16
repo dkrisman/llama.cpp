@@ -539,49 +539,66 @@ static __device__ __forceinline__ void fattn_mma_f8x4_to_h2x2(const uint32_t x, 
 #endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
-// Convert the 16 NVFP4 values of one sub-block (8 bytes of E2M1 nibbles, value j in the low and value j + 8 in the high
-//     nibble of byte j, and their UE4M3 scale) to 8 half2 in order. Exact: E2M1 x UE4M3 has at most 5 significant bits.
-static __device__ __forceinline__ void fattn_mma_nvfp4x16_to_h2x8(const uint2 qs, const uint32_t d, half2 * __restrict__ dst) {
-    // Pack nibbles of consecutive values into bytes: lo = values 0..7, hi = values 8..15, 2 values per byte.
-    const uint32_t lx = qs.x & 0x0F0F0F0F;
-    const uint32_t ly = qs.y & 0x0F0F0F0F;
-    const uint32_t hx = (qs.x >> 4) & 0x0F0F0F0F;
-    const uint32_t hy = (qs.y >> 4) & 0x0F0F0F0F;
-    const uint32_t lo = __byte_perm(lx | (lx >> 4), ly | (ly >> 4), 0x6420);
-    const uint32_t hi = __byte_perm(hx | (hx >> 4), hy | (hy >> 4), 0x6420);
+// NVFP4 sub-block (16 values: 8 bytes of E2M1 nibbles, value j in the low and value j + 8 in the high nibble of byte j,
+//     and a UE4M3 scale) -> f16. Exact: E2M1 x UE4M3 has at most 5 significant bits.
+// The conversion is done and stored in halves of 8 values (one 16 byte chunk each) to keep the number of live
+//     temporaries low: the store into shared memory happens while the MMA accumulators occupy almost all registers.
+
+// Scale as half2 (both halves).
+static __device__ __forceinline__ half2 fattn_mma_nvfp4_scale_h2(const uint32_t d) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    uint32_t h[8];
+    return __half2half2(__ushort_as_half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) d, __NV_E4M3).x));
+#else
+    // kvalues_mxfp4 are 2x the E2M1 values, ggml_cuda_ue4m3_to_fp32 is 0.5x the scale.
+    return __float2half2_rn(ggml_cuda_ue4m3_to_fp32(uint8_t(d)));
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+}
+
+// Repack the low (hi == false: values 0..7) or high (hi == true: values 8..15) nibbles of a sub-block
+//     into 4 bytes with 2 consecutive values each (first value in the low nibble).
+template <bool hi>
+static __device__ __forceinline__ uint32_t fattn_mma_nvfp4_pack8(const uint2 qs) {
+    const uint32_t x = (hi ? qs.x >> 4 : qs.x) & 0x0F0F0F0F;
+    const uint32_t y = (hi ? qs.y >> 4 : qs.y) & 0x0F0F0F0F;
+    return __byte_perm(x | (x >> 4), y | (y >> 4), 0x6420);
+}
+
+// 8 values packed by fattn_mma_nvfp4_pack8 times the scale -> 4 half2.
+static __device__ __forceinline__ void fattn_mma_nvfp4x8_to_h2x4(const uint32_t p, const half2 s, half2 * __restrict__ dst) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    uint32_t h[4];
     asm("{\n\t"
-        ".reg .b8 b0, b1, b2, b3, b4, b5, b6, b7;\n\t"
-        "mov.b32 {b0, b1, b2, b3}, %8;\n\t"
-        "mov.b32 {b4, b5, b6, b7}, %9;\n\t"
+        ".reg .b8 b0, b1, b2, b3;\n\t"
+        "mov.b32 {b0, b1, b2, b3}, %4;\n\t"
         "cvt.rn.f16x2.e2m1x2 %0, b0;\n\t"
         "cvt.rn.f16x2.e2m1x2 %1, b1;\n\t"
         "cvt.rn.f16x2.e2m1x2 %2, b2;\n\t"
         "cvt.rn.f16x2.e2m1x2 %3, b3;\n\t"
-        "cvt.rn.f16x2.e2m1x2 %4, b4;\n\t"
-        "cvt.rn.f16x2.e2m1x2 %5, b5;\n\t"
-        "cvt.rn.f16x2.e2m1x2 %6, b6;\n\t"
-        "cvt.rn.f16x2.e2m1x2 %7, b7;\n\t"
         "}"
-        : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3]), "=r"(h[4]), "=r"(h[5]), "=r"(h[6]), "=r"(h[7])
-        : "r"(lo), "r"(hi));
-    const half2 s = __half2half2(__ushort_as_half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) d, __NV_E4M3).x));
+        : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3]) : "r"(p));
 #pragma unroll
-    for (int k = 0; k < 8; ++k) {
+    for (int k = 0; k < 4; ++k) {
         dst[k] = __hmul2(*((const half2 *) &h[k]), s);
     }
 #else
-    // kvalues_mxfp4 are 2x the E2M1 values, ggml_cuda_ue4m3_to_fp32 is 0.5x the scale.
-    const float s = ggml_cuda_ue4m3_to_fp32(uint8_t(d));
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        const uint32_t bl = (lo >> (8*k)) & 0xFF;
-        const uint32_t bh = (hi >> (8*k)) & 0xFF;
-        dst[k + 0] = make_half2(s*kvalues_mxfp4[bl & 0x0F], s*kvalues_mxfp4[bl >> 4]);
-        dst[k + 4] = make_half2(s*kvalues_mxfp4[bh & 0x0F], s*kvalues_mxfp4[bh >> 4]);
+        const uint32_t b = (p >> (8*k)) & 0xFF;
+        dst[k] = __hmul2(make_half2(kvalues_mxfp4[b & 0x0F], kvalues_mxfp4[b >> 4]), s);
     }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
+}
+
+// Convert a sub-block and store it as 2 swizzled 16 byte chunks of f16 at tile_KV + offset (offset in half2).
+template <int stride_tile>
+static __device__ __forceinline__ void fattn_mma_nvfp4_store_sub(
+        const uint2 qs, const uint32_t d, half2 * __restrict__ tile_KV, const int offset, const int i) {
+    const half2 s = fattn_mma_nvfp4_scale_h2(d);
+    half2 tmp[4];
+    fattn_mma_nvfp4x8_to_h2x4(fattn_mma_nvfp4_pack8<false>(qs), s, tmp);
+    ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, offset + 0, i), tmp);
+    fattn_mma_nvfp4x8_to_h2x4(fattn_mma_nvfp4_pack8<true>(qs), s, tmp);
+    ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, offset + 4, i), tmp);
 }
 
 // Load the E2M1 data (8 bytes, 4 byte aligned) and the scale of sub-block sub of an NVFP4 block.
@@ -643,10 +660,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
             if (src) {
                 fattn_mma_nvfp4_load_sub(src + k/subs_per_blk, k % subs_per_blk, qs, d);
             }
-            half2 tmp[h2_per_sub];
-            fattn_mma_nvfp4x16_to_h2x8(qs, d, tmp);
-            ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_sub + 0,            i), tmp + 0);
-            ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_sub + h2_per_chunk, i), tmp + h2_per_chunk);
+            fattn_mma_nvfp4_store_sub<stride_tile>(qs, d, tile_KV, i*stride_tile + k*h2_per_sub, i);
         }
     } else if constexpr (use_cp_async) {
         static_assert(!kv_f8, "cp_async cannot convert FP8 K/V");
@@ -855,10 +869,7 @@ struct fattn_mma_nvfp4_stage {
 #pragma unroll
             for (int ik = 0; ik < nk; ++ik) {
                 const int k = ik*lanes_per_row + threadIdx.x % lanes_per_row;
-                half2 tmp[h2_per_sub];
-                fattn_mma_nvfp4x16_to_h2x8(r[ir*nk + ik], d[ir*nk + ik], tmp);
-                ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_sub + 0, i), tmp + 0);
-                ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_sub + 4, i), tmp + 4);
+                fattn_mma_nvfp4_store_sub<stride_tile>(r[ir*nk + ik], d[ir*nk + ik], tile_KV, i*stride_tile + k*h2_per_sub, i);
             }
         }
     }
