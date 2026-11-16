@@ -31,8 +31,15 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
         throw std::runtime_error("Gemma 4 assistant requires embedding_length_out to carry the target hidden size");
     }
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
-    output   = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+    // The drafter takes its input embeddings from the target model, so its own
+    // token_embd is only the (tied) output head. An untied output.weight (e.g.
+    // NVFP4 + output.scale) replaces it and token_embd may then be absent.
+    output   = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"),  { 1 },             TENSOR_NOT_REQUIRED);
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, output ? TENSOR_NOT_REQUIRED : 0);
+    if (!output) {
+        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+    }
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
 
@@ -185,7 +192,7 @@ llama_model_gemma4_assistant::graph::graph(const llm_graph_params & params) :
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    ggml_tensor * logits = build_lora_mm(model.output, cur);
+    ggml_tensor * logits = build_lora_mm(model.output, cur, model.output_s);
     cb(logits, "result_output", -1);
     res->t_logits = logits;
 
