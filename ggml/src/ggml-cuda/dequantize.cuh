@@ -43,6 +43,24 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
     v.y = (c1 - 1) * d;
 }
 
+// NVFP4 for the generic dequantize_block kernel (qk = QK_NVFP4, qr = 2): values iqs and iqs + QK_NVFP4/2 of block ib.
+// Within a 16 value sub-block, value j is the low nibble and value j + 8 the high nibble of byte j.
+static __device__ __forceinline__ void dequantize_nvfp4(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_nvfp4 * x = (const block_nvfp4 *) vx + ib;
+
+    float vv[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int p = iqs + h*(QK_NVFP4/2);
+        const int s = p / QK_NVFP4_SUB;
+        const int j = p % QK_NVFP4_SUB;
+        const uint8_t q = x->qs[s*(QK_NVFP4_SUB/2) + j % (QK_NVFP4_SUB/2)];
+        vv[h] = ggml_cuda_ue4m3_to_fp32(x->d[s]) * kvalues_mxfp4[j < QK_NVFP4_SUB/2 ? q & 0x0F : q >> 4];
+    }
+    v.x = vv[0];
+    v.y = vv[1];
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 

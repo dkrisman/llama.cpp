@@ -186,6 +186,70 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+// UE4M3 encoding identical to ggml_fp32_to_ue4m3 (CPU reference): round half up on the mantissa, saturate to 0x7E.
+static __device__ __forceinline__ uint8_t fp32_to_ue4m3_ref(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    x = fminf(x, 448.0f);
+    const uint32_t bits = __float_as_uint(x);
+    const int fp32_exp  = int((bits >> 23) & 0xFF) - 127;
+    const int fp32_man  = (bits >> 20) & 0x7;
+    int ue4m3_exp = fp32_exp + 7;
+    if (ue4m3_exp <= 0) {
+        const int man = min(int(x * 512.0f + 0.5f), 7);
+        return man < 1 ? 0 : uint8_t(man);
+    }
+    if (ue4m3_exp >= 15) {
+        return 0x7E;
+    }
+    int ue4m3_man = fp32_man + int((bits >> 19) & 1);
+    if (ue4m3_man > 7) {
+        ue4m3_man = 0;
+        ue4m3_exp++;
+        if (ue4m3_exp >= 15) {
+            return 0x7E;
+        }
+    }
+    return uint8_t((ue4m3_exp << 3) | ue4m3_man);
+}
+
+// Same result as quantize_row_nvfp4_ref (per 16 values: UE4M3 scale amax/6, nearest E2M1 value, ties to the lower index).
+static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, block_nvfp4 * __restrict__ y) {
+#pragma unroll
+    for (int s = 0; s < QK_NVFP4/QK_NVFP4_SUB; ++s) {
+        const float * xb = x + s*QK_NVFP4_SUB;
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+            amax = fmaxf(amax, fabsf(xb[j]));
+        }
+
+        const uint8_t ue = fp32_to_ue4m3_ref(amax / 6.0f);
+        y->d[s] = ue;
+        const float d = ggml_cuda_ue4m3_to_fp32(ue);
+
+        for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+            uint8_t q[2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const float v = xb[h*(QK_NVFP4_SUB/2) + j];
+                int   best_i   = 0;
+                float best_err = fabsf(kvalues_mxfp4[0]*d - v);
+                for (int i = 1; i < 16; ++i) {
+                    const float err = fabsf(kvalues_mxfp4[i]*d - v);
+                    if (err < best_err) {
+                        best_i   = i;
+                        best_err = err;
+                    }
+                }
+                q[h] = best_i;
+            }
+            y->qs[s*(QK_NVFP4_SUB/2) + j] = q[0] | (q[1] << 4);
+        }
+    }
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
