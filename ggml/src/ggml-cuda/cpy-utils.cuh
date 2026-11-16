@@ -214,40 +214,43 @@ static __device__ __forceinline__ uint8_t fp32_to_ue4m3_ref(float x) {
     return uint8_t((ue4m3_exp << 3) | ue4m3_man);
 }
 
-// Same result as quantize_row_nvfp4_ref (per 16 values: UE4M3 scale amax/6, nearest E2M1 value, ties to the lower index).
-static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, block_nvfp4 * __restrict__ y) {
+// One 16 value sub-block of quantize_row_nvfp4_ref (UE4M3 scale amax/6, nearest E2M1 value, ties to the lower index),
+//     bitwise identical to the CPU reference:
+//     the reference scans all 16 E2M1 codes; for v >= 0 only the codes 0..7 can win, for v < 0 code 0 and the negative codes
+//     9..15, whose errors are exactly the errors of the magnitudes 1..7 for |v| (negation is exact), in the same order.
+//     __fmul_rn: no FMA contraction, ties must break like on the CPU.
+static __device__ __forceinline__ void quantize_f32_nvfp4_sub(const float * __restrict__ xb, block_nvfp4 * __restrict__ y, const int s) {
+    float amax = 0.0f;
 #pragma unroll
-    for (int s = 0; s < QK_NVFP4/QK_NVFP4_SUB; ++s) {
-        const float * xb = x + s*QK_NVFP4_SUB;
+    for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+        amax = fmaxf(amax, fabsf(xb[j]));
+    }
 
-        float amax = 0.0f;
-        for (int j = 0; j < QK_NVFP4_SUB; ++j) {
-            amax = fmaxf(amax, fabsf(xb[j]));
-        }
+    const uint8_t ue = fp32_to_ue4m3_ref(amax / 6.0f);
+    y->d[s] = ue;
+    const float d = ggml_cuda_ue4m3_to_fp32(ue);
 
-        const uint8_t ue = fp32_to_ue4m3_ref(amax / 6.0f);
-        y->d[s] = ue;
-        const float d = ggml_cuda_ue4m3_to_fp32(ue);
-
-        for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
-            uint8_t q[2];
+    constexpr float kmag[8] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f}; // kvalues_mxfp4[0..7]
+    uint8_t q[QK_NVFP4_SUB];
 #pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                const float v = xb[h*(QK_NVFP4_SUB/2) + j];
-                int   best_i   = 0;
-                // __fmul_rn: no FMA contraction, ties must break like on the CPU
-                float best_err = fabsf(__fmul_rn(kvalues_mxfp4[0], d) - v);
-                for (int i = 1; i < 16; ++i) {
-                    const float err = fabsf(__fmul_rn(kvalues_mxfp4[i], d) - v);
-                    if (err < best_err) {
-                        best_i   = i;
-                        best_err = err;
-                    }
-                }
-                q[h] = best_i;
+    for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+        const float v  = xb[j];
+        const float av = fabsf(v);
+        int   best_m   = 0;
+        float best_err = av; // fabsf(0*d - |v|)
+#pragma unroll
+        for (int m = 1; m < 8; ++m) {
+            const float err = fabsf(__fmul_rn(kmag[m], d) - av);
+            if (err < best_err) {
+                best_m   = m;
+                best_err = err;
             }
-            y->qs[s*(QK_NVFP4_SUB/2) + j] = q[0] | (q[1] << 4);
         }
+        q[j] = v < 0.0f && best_m > 0 ? 8 + best_m : best_m;
+    }
+#pragma unroll
+    for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+        y->qs[s*(QK_NVFP4_SUB/2) + j] = q[j] | (q[j + QK_NVFP4_SUB/2] << 4);
     }
 }
 

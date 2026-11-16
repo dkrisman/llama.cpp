@@ -13926,6 +13926,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 34816,    1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1},  3328, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
     }
+    // KV cache writes (Gemma 4 26B-A4B: SWA rows 8x256, global rows 2x512), decode / draft verify / prompt ubatch
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_0, GGML_TYPE_NVFP4}) {
+        for (int n_embd : {2048, 1024}) {
+            for (int r : {1, 4, 1024}) {
+                test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type_KV, GGML_TYPE_I64, {n_embd, 4096, 1, 1}, {1, 1}, r, false));
+            }
+        }
+    }
+    // Gemma 4 26B-A4B SWA layers (256, 8 KV heads, GQA 2, ~2K cells): decode and MTP draft verify
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_0, GGML_TYPE_NVFP4}) {
+        for (int nb : {1, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 2048, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+    }
     // Same global-layer prefill shape at ~112K depth (114688 + ubatch 2048), decode and MTP draft verify (4 tokens) at 112K
     for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3, GGML_TYPE_NVFP4}) {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 116736, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));

@@ -174,6 +174,42 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f8_e4m3(
     return sum;
 }
 
+// NVFP4 K: every thread handles 4 consecutive values (one 32 bit word of E2M1 nibbles, low or high half of a
+//     16 value sub-block) per step, Q is f16/f32 like for FP8.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_nvfp4 * K_fp4 = (const block_nvfp4 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D; k_KQ_0 += nthreads*4) {
+        const int k   = k_KQ_0 + (threadIdx.x % nthreads)*4;
+        const int j   = k % QK_NVFP4_SUB;
+        const int sub = (k % QK_NVFP4) / QK_NVFP4_SUB;
+        const block_nvfp4 * b = K_fp4 + k/QK_NVFP4;
+        uint32_t q;
+        ggml_cuda_memcpy_1<sizeof(q)>(&q, b->qs + sub*(QK_NVFP4_SUB/2) + j % (QK_NVFP4_SUB/2));
+        q = (j >= QK_NVFP4_SUB/2 ? q >> 4 : q) & 0x0F0F0F0F;
+        const float d = ggml_cuda_ue4m3_to_fp32(b->d[sub]); // 0.5x the scale, kvalues_mxfp4 are 2x the E2M1 values
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < 4; ++k_KQ_1) {
+            const float kv = d * kvalues_mxfp4[(q >> (8*k_KQ_1)) & 0x0F];
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            sum += kv * __half2float(((const half *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#else
+            sum += kv * ((const float *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+#endif // V_DOT2_F32_F16_AVAILABLE
+        }
+    }
+
+    return sum;
+}
+
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -447,6 +483,24 @@ static __device__ __forceinline__ void dequantize_V_f8_e4m3(const void * __restr
     }
 }
 
+// NVFP4 V: ne == 4 consecutive values starting at i0 (multiple of 4) are one word of E2M1 nibbles of a sub-block.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_nvfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    static_assert(ne == 4, "bad ne");
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, float>, "unsupported type");
+    const block_nvfp4 * b = (const block_nvfp4 *) vx + i0/QK_NVFP4;
+    const int sub = (i0 % QK_NVFP4) / QK_NVFP4_SUB;
+    const int j   =  i0 % QK_NVFP4_SUB;
+    uint32_t q;
+    ggml_cuda_memcpy_1<sizeof(q)>(&q, b->qs + sub*(QK_NVFP4_SUB/2) + j % (QK_NVFP4_SUB/2));
+    q = (j >= QK_NVFP4_SUB/2 ? q >> 4 : q) & 0x0F0F0F0F;
+    const float d = ggml_cuda_ue4m3_to_fp32(b->d[sub]);
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        ((T *) dst)[l] = ggml_cuda_cast<T>(d * kvalues_mxfp4[(q >> (8*l)) & 0x0F]);
+    }
+}
+
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q4_0 * x = (const block_q4_0 *) vx;
@@ -687,6 +741,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_F8_E4M3) {
         return vec_dot_fattn_vec_KQ_f8_e4m3<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_NVFP4) {
+        return vec_dot_fattn_vec_KQ_nvfp4<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -711,6 +767,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_bf16<float, ne>;
     } else if constexpr (type_V == GGML_TYPE_F8_E4M3) {
         return dequantize_V_f8_e4m3<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_NVFP4) {
+        return dequantize_V_nvfp4<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
