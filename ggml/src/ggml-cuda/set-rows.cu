@@ -110,23 +110,21 @@ static void set_rows_cuda_quant(
     }
 }
 
-// NVFP4: one thread per 16 value sub-block (4 per block_nvfp4), each writes its scale and 8 bytes of E2M1 data.
+// NVFP4: 4 lanes per 16 value sub-block (16 per block_nvfp4), see quantize_f32_nvfp4_sub_x4.
 template <typename idx_t>
 static __global__ void k_set_rows_nvfp4(const float * __restrict__ src0,
                                         const idx_t * __restrict__ src1,
                                         block_nvfp4 * __restrict__ dst,
-                                        const int64_t ne_total, // number of sub-blocks
+                                        const int64_t ne_total, // number of sub-blocks * 4
                                         const int64_t s01, const int64_t s02, const int64_t s03,
                                         const int64_t s10, const int64_t s11, const int64_t s12,
                                         const int64_t s1, const int64_t s2, const int64_t s3,
                                         const uint3 ne00, const uint3 ne01, const uint3 ne02,
                                         const uint3 ne11_fd, const uint3 ne12_fd) {
     constexpr int nsub = QK_NVFP4/QK_NVFP4_SUB;
-    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
-
-    if (i >= ne_total) {
-        return;
-    }
+    // no early return: all 4 lanes of a group take part in the shuffles (ne_total and blockDim.x are multiples of 4)
+    const bool    valid = int64_t(blockDim.x) * blockIdx.x + threadIdx.x < ne_total;
+    const int64_t i     = valid ? (int64_t(blockDim.x) * blockIdx.x + threadIdx.x) / 4 : 0;
 
     const int     sub    = i % nsub;
     const int64_t i_base = (i / nsub) * QK_NVFP4;
@@ -150,12 +148,12 @@ static __global__ void k_set_rows_nvfp4(const float * __restrict__ src0,
     const int64_t i10 = i01;
 
     ggml_cuda_pdl_sync();
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const int64_t dst_row = valid ? *(src1 + i10*s10 + i11*s11 + i12*s12) : 0;
 
     const float * src_sub   = src0 + i01*s01 + i02*s02 + i03*s03 + i00 + sub*QK_NVFP4_SUB;
     block_nvfp4 * dst_block = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_nvfp4) + i00/QK_NVFP4;
 
-    quantize_f32_nvfp4_sub(src_sub, dst_block, sub);
+    quantize_f32_nvfp4_sub_x4(src_sub, dst_block, sub, valid);
 }
 
 template<typename idx_t>
@@ -168,7 +166,7 @@ static void set_rows_cuda_nvfp4(
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
     GGML_ASSERT(ne00 % QK_NVFP4 == 0);
-    const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / QK_NVFP4_SUB;
+    const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / QK_NVFP4_SUB * 4;
     const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
 
     if (ne_total > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
