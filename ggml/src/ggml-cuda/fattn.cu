@@ -663,6 +663,15 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+// A/B switch: GGML_CUDA_FA_NVFP4_VEC_DECODE=1 runs NVFP4 single-token decode on the vector kernel.
+static bool ggml_cuda_fattn_nvfp4_vec_decode() {
+    static const bool force = [] {
+        const char * env = getenv("GGML_CUDA_FA_NVFP4_VEC_DECODE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return force;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -771,10 +780,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc)) {
-        // NVFP4: the MMA kernel reads it natively and is faster than the vector kernel also for small batches
-        //     (D=256 GQA 2 kv 2048: nb 1 vector 18.7 us, MMA nb 4 8.9 us; fp8 vector nb 1 10.6 us).
+        // NVFP4 (read natively by both kernels): the MMA kernel is faster also for single-token decode on Blackwell
+        //     (D=256 GQA 2 nb 1: kv 256 MMA 6.1 us / vector 7.4 us, kv 2048 8.7 / 12.0 us; fp8 vector 6.5 / 10.5 us).
+        //     GGML_CUDA_FA_NVFP4_VEC_DECODE=1: vector kernel under the same conditions as f16/FP8.
         if (ggml_cuda_fattn_mma_kv_native_fmt(cc, dst) == FATTN_MMA_KV_NVFP4) {
-            return BEST_FATTN_KERNEL_MMA_F16;
+            const bool vec_ok = can_use_vector_kernel && ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) != nullptr &&
+                cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 &&
+                !(gqa_ratio > 4 && (Q->ne[0] >= 256 || K->ne[1] >= 8192));
+            return vec_ok && ggml_cuda_fattn_nvfp4_vec_decode() ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_MMA_F16;
         }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {

@@ -174,6 +174,27 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f8_e4m3(
     return sum;
 }
 
+// 4 consecutive NVFP4 values (one nibble in the low half of each byte of q) -> E2M1 as 2 float2 (unscaled).
+static __device__ __forceinline__ void fattn_vec_nvfp4x4_to_f2x2(const uint32_t q, float2 & v01, float2 & v23) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const uint32_t p = q | (q >> 4); // bytes 0 and 2 hold 2 consecutive values each (first in the low nibble)
+    uint32_t h01;
+    uint32_t h23;
+    asm("{\n\t"
+        ".reg .b8 b0, b1, b2, b3;\n\t"
+        "mov.b32 {b0, b1, b2, b3}, %2;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %1, b2;\n\t"
+        "}" : "=r"(h01), "=r"(h23) : "r"(p));
+    v01 = __half22float2(*((const half2 *) &h01));
+    v23 = __half22float2(*((const half2 *) &h23));
+#else
+    // kvalues_mxfp4 are 2x the E2M1 values
+    v01 = make_float2(0.5f*kvalues_mxfp4[(q >>  0) & 0x0F], 0.5f*kvalues_mxfp4[(q >>  8) & 0x0F]);
+    v23 = make_float2(0.5f*kvalues_mxfp4[(q >> 16) & 0x0F], 0.5f*kvalues_mxfp4[(q >> 24) & 0x0F]);
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+}
+
 // NVFP4 K: every thread handles 4 consecutive values (one 32 bit word of E2M1 nibbles, low or high half of a
 //     16 value sub-block) per step, Q is f16/f32 like for FP8.
 template <int D, int nthreads>
@@ -195,16 +216,18 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
         uint32_t q;
         ggml_cuda_memcpy_1<sizeof(q)>(&q, b->qs + sub*(QK_NVFP4_SUB/2) + j % (QK_NVFP4_SUB/2));
         q = (j >= QK_NVFP4_SUB/2 ? q >> 4 : q) & 0x0F0F0F0F;
-        const float d = ggml_cuda_ue4m3_to_fp32(b->d[sub]); // 0.5x the scale, kvalues_mxfp4 are 2x the E2M1 values
-#pragma unroll
-        for (int k_KQ_1 = 0; k_KQ_1 < 4; ++k_KQ_1) {
-            const float kv = d * kvalues_mxfp4[(q >> (8*k_KQ_1)) & 0x0F];
+        const float d = 2.0f*ggml_cuda_ue4m3_to_fp32(b->d[sub]); // ggml_cuda_ue4m3_to_fp32 is 0.5x the scale
+        float2 k01;
+        float2 k23;
+        fattn_vec_nvfp4x4_to_f2x2(q, k01, k23);
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            sum += kv * __half2float(((const half *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+        const half * Q_h = (const half *) Q_v + k_KQ_0/nthreads;
+        const float part = k01.x*__half2float(Q_h[0]) + k01.y*__half2float(Q_h[1]) + k23.x*__half2float(Q_h[2]) + k23.y*__half2float(Q_h[3]);
 #else
-            sum += kv * ((const float *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+        const float * Q_f = (const float *) Q_v + k_KQ_0/nthreads;
+        const float part = k01.x*Q_f[0] + k01.y*Q_f[1] + k23.x*Q_f[2] + k23.y*Q_f[3];
 #endif // V_DOT2_F32_F16_AVAILABLE
-        }
+        sum += d*part;
     }
 
     return sum;
@@ -494,11 +517,14 @@ static __device__ __forceinline__ void dequantize_V_nvfp4(const void * __restric
     uint32_t q;
     ggml_cuda_memcpy_1<sizeof(q)>(&q, b->qs + sub*(QK_NVFP4_SUB/2) + j % (QK_NVFP4_SUB/2));
     q = (j >= QK_NVFP4_SUB/2 ? q >> 4 : q) & 0x0F0F0F0F;
-    const float d = ggml_cuda_ue4m3_to_fp32(b->d[sub]);
-#pragma unroll
-    for (int l = 0; l < ne; ++l) {
-        ((T *) dst)[l] = ggml_cuda_cast<T>(d * kvalues_mxfp4[(q >> (8*l)) & 0x0F]);
-    }
+    const float d = 2.0f*ggml_cuda_ue4m3_to_fp32(b->d[sub]); // ggml_cuda_ue4m3_to_fp32 is 0.5x the scale
+    float2 v01;
+    float2 v23;
+    fattn_vec_nvfp4x4_to_f2x2(q, v01, v23);
+    ((T *) dst)[0] = ggml_cuda_cast<T>(d*v01.x);
+    ((T *) dst)[1] = ggml_cuda_cast<T>(d*v01.y);
+    ((T *) dst)[2] = ggml_cuda_cast<T>(d*v23.x);
+    ((T *) dst)[3] = ggml_cuda_cast<T>(d*v23.y);
 }
 
 template <typename T, int ne>

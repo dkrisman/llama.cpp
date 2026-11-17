@@ -214,24 +214,15 @@ static __device__ __forceinline__ uint8_t fp32_to_ue4m3_ref(float x) {
     return uint8_t((ue4m3_exp << 3) | ue4m3_man);
 }
 
-// One 16 value sub-block of quantize_row_nvfp4_ref (UE4M3 scale amax/6, nearest E2M1 value, ties to the lower index),
-//     bitwise identical to the CPU reference:
-//     the reference scans all 16 E2M1 codes; for v >= 0 only the codes 0..7 can win, for v < 0 code 0 and the negative codes
-//     9..15, whose errors are exactly the errors of the magnitudes 1..7 for |v| (negation is exact), in the same order.
-//     __fmul_rn: no FMA contraction, ties must break like on the CPU.
-static __device__ __forceinline__ void quantize_f32_nvfp4_sub(const float * __restrict__ xb, block_nvfp4 * __restrict__ y, const int s) {
-    float amax = 0.0f;
-#pragma unroll
-    for (int j = 0; j < QK_NVFP4_SUB; ++j) {
-        amax = fmaxf(amax, fabsf(xb[j]));
-    }
-
-    const uint8_t ue = fp32_to_ue4m3_ref(amax / 6.0f);
-    y->d[s] = ue;
+// E2M1 codes of a 16 value sub-block for the UE4M3 scale code ue and their squared error, bitwise identical to
+//     nvfp4_quantize_sub in ggml-quants.c (nearest value, ties to the lower code; the reference scans all 16 codes:
+//     for v >= 0 only the codes 0..7 can win, for v < 0 code 0 and the negative codes 9..15, whose errors are exactly
+//     the errors of the magnitudes 1..7 for |v| as negation is exact, in the same order).
+//     __fmul_rn/__fadd_rn: no FMA contraction, ties and the error sum must match the CPU.
+static __device__ __forceinline__ float quantize_f32_nvfp4_codes(const float * __restrict__ xb, const uint8_t ue, uint8_t * __restrict__ q) {
     const float d = ggml_cuda_ue4m3_to_fp32(ue);
-
     constexpr float kmag[8] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f}; // kvalues_mxfp4[0..7]
-    uint8_t q[QK_NVFP4_SUB];
+    float sse = 0.0f;
 #pragma unroll
     for (int j = 0; j < QK_NVFP4_SUB; ++j) {
         const float v  = xb[j];
@@ -247,10 +238,33 @@ static __device__ __forceinline__ void quantize_f32_nvfp4_sub(const float * __re
             }
         }
         q[j] = v < 0.0f && best_m > 0 ? 8 + best_m : best_m;
+        const float qv = v < 0.0f ? -kmag[best_m] : kmag[best_m];
+        const float e  = __fsub_rn(__fmul_rn(qv, d), v);
+        sse = __fadd_rn(sse, __fmul_rn(e, e));
     }
+    return sse;
+}
+
+// One 16 value sub-block of quantize_row_nvfp4_ref ("four over six": absmax scaled to 6 or 4, lower squared error).
+static __device__ __forceinline__ void quantize_f32_nvfp4_sub(const float * __restrict__ xb, block_nvfp4 * __restrict__ y, const int s) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+        amax = fmaxf(amax, fabsf(xb[j]));
+    }
+
+    uint8_t q6[QK_NVFP4_SUB];
+    uint8_t q4[QK_NVFP4_SUB];
+    const uint8_t ue6 = fp32_to_ue4m3_ref(amax / 6.0f);
+    const uint8_t ue4 = fp32_to_ue4m3_ref(amax / 4.0f);
+    const float sse6 = quantize_f32_nvfp4_codes(xb, ue6, q6);
+    const float sse4 = quantize_f32_nvfp4_codes(xb, ue4, q4);
+    const bool use4 = sse4 < sse6;
+
+    y->d[s] = use4 ? ue4 : ue6;
 #pragma unroll
     for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
-        y->qs[s*(QK_NVFP4_SUB/2) + j] = q[j] | (q[j + QK_NVFP4_SUB/2] << 4);
+        y->qs[s*(QK_NVFP4_SUB/2) + j] = use4 ? q4[j] | (q4[j + QK_NVFP4_SUB/2] << 4) : q6[j] | (q6[j + QK_NVFP4_SUB/2] << 4);
     }
 }
 

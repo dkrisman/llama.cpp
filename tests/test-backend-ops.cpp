@@ -13936,8 +13936,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // Gemma 4 26B-A4B SWA layers (256, 8 KV heads, GQA 2, ~2K cells): decode and MTP draft verify
     for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_0, GGML_TYPE_NVFP4}) {
-        for (int nb : {1, 4}) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 2048, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        for (int kv : {256, 2048}) {
+            for (int nb : {1, 4}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
         }
     }
     // Same global-layer prefill shape at ~112K depth (114688 + ubatch 2048), decode and MTP draft verify (4 tokens) at 112K
