@@ -243,9 +243,11 @@ static __device__ __forceinline__ uint32_t quantize_f32_nvfp4_code(const float v
 // four_over_six (opt-in, GGML_CUDA_NVFP4_FOUR_OVER_SIX=1, not the CPU reference): also try the absmax scaled to 4 and keep
 //     the lower squared error (summed in j order by lane 0). Lower MSE, but worse for Gemma 4 26B-A4B K/V in practice
 //     (first-token probabilities and AA-LCR thinking starts drift from f16 more than with amax/6).
+//     keep4: pick 4 only if sse4 < keep4 * sse6 (1 = plain lower error); weighted: errors weighted by |x|.
 template <bool four_over_six>
 static __device__ __forceinline__ void quantize_f32_nvfp4_sub_x4(
-        const float * __restrict__ xb, block_nvfp4 * __restrict__ y, const int s, const bool valid) {
+        const float * __restrict__ xb, block_nvfp4 * __restrict__ y, const int s, const bool valid,
+        const float keep4 = 1.0f, const bool weighted = false) {
     const int t = threadIdx.x % 4;
     float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if (valid) {
@@ -272,6 +274,10 @@ static __device__ __forceinline__ void quantize_f32_nvfp4_sub_x4(
         c6 |= quantize_f32_nvfp4_code(x[k], d6, e6[k]) << (8*k);
         if constexpr (four_over_six) {
             c4 |= quantize_f32_nvfp4_code(x[k], d4, e4[k]) << (8*k);
+            if (weighted) {
+                e6[k] = __fmul_rn(e6[k], fabsf(x[k]));
+                e4[k] = __fmul_rn(e4[k], fabsf(x[k]));
+            }
         }
     }
 
@@ -290,7 +296,7 @@ static __device__ __forceinline__ void quantize_f32_nvfp4_sub_x4(
                 sse4 = __fadd_rn(sse4, a4);
             }
         }
-        use4 = __shfl_sync(0xFFFFFFFF, sse4 < sse6, 0, 4);
+        use4 = __shfl_sync(0xFFFFFFFF, sse4 < __fmul_rn(keep4, sse6), 0, 4);
     }
     const uint32_t c  = use4 ? c4 : c6;
     // byte j (j < 8) of qs = code j | code (j + 8) << 4: lanes 0/1 hold codes 0..7, lanes 2/3 codes 8..15
