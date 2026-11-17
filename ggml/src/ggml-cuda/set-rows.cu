@@ -120,7 +120,8 @@ static __global__ void k_set_rows_nvfp4(const float * __restrict__ src0,
                                         const int64_t s10, const int64_t s11, const int64_t s12,
                                         const int64_t s1, const int64_t s2, const int64_t s3,
                                         const uint3 ne00, const uint3 ne01, const uint3 ne02,
-                                        const uint3 ne11_fd, const uint3 ne12_fd) {
+                                        const uint3 ne11_fd, const uint3 ne12_fd,
+                                        const float keep4, const bool weighted) {
     constexpr int nsub = QK_NVFP4/QK_NVFP4_SUB;
     // no early return: all 4 lanes of a group take part in the shuffles (ne_total and blockDim.x are multiples of 4)
     const bool    valid = int64_t(blockDim.x) * blockIdx.x + threadIdx.x < ne_total;
@@ -153,11 +154,72 @@ static __global__ void k_set_rows_nvfp4(const float * __restrict__ src0,
     const float * src_sub   = src0 + i01*s01 + i02*s02 + i03*s03 + i00 + sub*QK_NVFP4_SUB;
     block_nvfp4 * dst_block = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_nvfp4) + i00/QK_NVFP4;
 
-    quantize_f32_nvfp4_sub_x4<four_over_six>(src_sub, dst_block, sub, valid);
+    quantize_f32_nvfp4_sub_x4<four_over_six>(src_sub, dst_block, sub, valid, keep4, weighted);
+}
+
+// four-over-six experiment knobs (all opt-in, read once):
+//   GGML_CUDA_NVFP4_FOUR_OVER_SIX=1  enable
+//   GGML_CUDA_NVFP4_46_TENSORS=k|v   only K or only V cache writes (default both)
+//   GGML_CUDA_NVFP4_46_NE0=N         only cache tensors with row size N (e.g. Gemma 4 26B SWA 2048, global 1024)
+//   GGML_CUDA_NVFP4_46_MARGIN=m      pick 4 only if its error is below (1 - m) * error of 6
+//   GGML_CUDA_NVFP4_46_WEIGHTED=1    squared errors weighted by |x|
+struct nvfp4_46_cfg {
+    bool  on       = false;
+    char  tensors  = 0;
+    long  ne0      = 0;
+    float keep4    = 1.0f;
+    bool  weighted = false;
+};
+
+static const nvfp4_46_cfg & nvfp4_46_get_cfg() {
+    static const nvfp4_46_cfg cfg = [] {
+        nvfp4_46_cfg c;
+        const char * e = getenv("GGML_CUDA_NVFP4_FOUR_OVER_SIX");
+        c.on = e != nullptr && atoi(e) != 0;
+        if ((e = getenv("GGML_CUDA_NVFP4_46_TENSORS")) && (e[0] == 'k' || e[0] == 'v')) {
+            c.tensors = e[0];
+        }
+        if ((e = getenv("GGML_CUDA_NVFP4_46_NE0"))) {
+            c.ne0 = atol(e);
+        }
+        if ((e = getenv("GGML_CUDA_NVFP4_46_MARGIN"))) {
+            c.keep4 = 1.0f - (float) atof(e);
+        }
+        if ((e = getenv("GGML_CUDA_NVFP4_46_WEIGHTED"))) {
+            c.weighted = atoi(e) != 0;
+        }
+        if (c.on) {
+            GGML_LOG_INFO("%s: NVFP4 four-over-six: tensors %c ne0 %ld keep4 %.3f weighted %d\n", __func__,
+                c.tensors ? c.tensors : '*', c.ne0, c.keep4, c.weighted);
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+// cache tensor (root of the view chain) named cache_k_l* / cache_v_l* by llama-kv-cache
+static bool nvfp4_46_applies(const ggml_tensor * dst) {
+    const nvfp4_46_cfg & cfg = nvfp4_46_get_cfg();
+    if (!cfg.on) {
+        return false;
+    }
+    const ggml_tensor * root = dst;
+    while (root->view_src) {
+        root = root->view_src;
+    }
+    if (cfg.ne0 != 0 && root->ne[0] != cfg.ne0) {
+        return false;
+    }
+    if (cfg.tensors != 0) {
+        const char want[] = {'c','a','c','h','e','_', cfg.tensors, '_', '\0'};
+        return strncmp(root->name, want, 8) == 0;
+    }
+    return true;
 }
 
 template<typename idx_t>
 static void set_rows_cuda_nvfp4(
+        const bool four_over_six,
         const float * src0_d, const idx_t * src1_d, block_nvfp4 * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t ne11, const int64_t ne12,
@@ -170,10 +232,7 @@ static void set_rows_cuda_nvfp4(
     const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
 
     if (ne_total > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
-        static const bool four_over_six = [] {
-            const char * env = getenv("GGML_CUDA_NVFP4_FOUR_OVER_SIX");
-            return env != nullptr && atoi(env) != 0;
-        }();
+        const nvfp4_46_cfg & cfg = nvfp4_46_get_cfg();
         auto kernel = four_over_six ? k_set_rows_nvfp4<idx_t, true> : k_set_rows_nvfp4<idx_t, false>;
         kernel<<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
             src0_d, src1_d, dst_d, ne_total,
@@ -181,7 +240,7 @@ static void set_rows_cuda_nvfp4(
             nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t),
             nb1, nb2, nb3,
             init_fastdiv_values((uint32_t) ne00), init_fastdiv_values((uint32_t) ne01), init_fastdiv_values((uint32_t) ne02),
-            init_fastdiv_values((uint32_t) ne11), init_fastdiv_values((uint32_t) ne12));
+            init_fastdiv_values((uint32_t) ne11), init_fastdiv_values((uint32_t) ne12), cfg.keep4, cfg.weighted);
     }
 }
 
@@ -394,6 +453,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         );
     } else if (dst->type == GGML_TYPE_NVFP4) {
         set_rows_cuda_nvfp4<idx_t>(
+            nvfp4_46_applies(dst),
             src0_d, src1_d, (block_nvfp4*)dst->data,
             ne00, ne01, ne02, ne03,
             ne11, ne12,
