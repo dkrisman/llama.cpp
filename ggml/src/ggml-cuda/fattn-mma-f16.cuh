@@ -2,6 +2,9 @@
 #include "cp-async.cuh"
 #include "mma.cuh"
 #include "fattn-common.cuh"
+#ifdef GGML_CUDA_FA_NVFP4_TC
+#include "cpy-utils.cuh"
+#endif // GGML_CUDA_FA_NVFP4_TC
 
 using namespace ggml_cuda_mma;
 
@@ -829,6 +832,10 @@ struct fattn_mma_f8_stage {
     }
 };
 
+// FP4 tensor core KQ (see fattn_mma_fp4_mma): bytes per row of a raw K chunk and per Q column.
+static constexpr int fattn_mma_tc_stride_K = 48;
+static constexpr int fattn_mma_tc_stride_Q = 304; // 8 blocks of 36 bytes + pad, conflict-free fragment loads
+
 // NVFP4 K/V chunk staged in registers for the chunk pipeline, analogous to fattn_mma_f8_stage.
 // D2 is in units of 2 K/V values, every thread handles sub-blocks of 16 values (8 + 1 bytes -> 32 bytes of f16) per row and step.
 template<int stride_tile, int nwarps, int nbatch_fa, int D2>
@@ -873,7 +880,51 @@ struct fattn_mma_nvfp4_stage {
             }
         }
     }
+
+    // FP4 tensor core KQ (GGML_CUDA_FA_NVFP4_TC): the raw blocks, one per row (D2 == QK_NVFP4/2) at
+    //     fattn_mma_tc_stride_K bytes per row: qs[32] then the 4 sub-block scales.
+    __device__ __forceinline__ void store_raw(half2 * const __restrict__ tile_KV) const {
+        static_assert(D2 == QK_NVFP4/2, "raw store: one block per row");
+        char * const tile_b = (char *) tile_KV;
+#pragma unroll
+        for (int ir = 0; ir < nrows; ++ir) {
+            const int i = (ir*nwarps + threadIdx.y)*rows_per_warp + threadIdx.x/lanes_per_row;
+            const int k = threadIdx.x % lanes_per_row;
+            *(uint2 *) (tile_b + i*fattn_mma_tc_stride_K + k*8) = r[ir];
+            tile_b[i*fattn_mma_tc_stride_K + 32 + k] = d[ir];
+        }
+    }
 };
+
+// FP4 tensor core KQ (experimental, GGML_CUDA_FA_NVFP4_TC, D=512 V split only):
+//     mma m16n8k64 kind::mxf4nvf4 scale_vec::4X with UE4M3 scales takes the raw block_nvfp4 bytes: for a row of 64 values,
+//     the 32 bit words qs[4c..4c+3] / qs[16+4c..] are the fragment registers of quad lane c (the nibble order within a
+//     16 value sub-block is permuted the same way for A and B, sub-blocks stay with their scale) and the 4 scale bytes
+//     are the scale register. ggml's UE4M3 x 0.5 and E2M1 x 2 cancel, so the product is exact as for f16.
+//     Q is quantized to NVFP4 (amax/6) in shared memory once per tile, K chunks are stored raw (48 bytes per row:
+//     conflict-free fragment loads). V stays f16.
+
+static __device__ __forceinline__ void fattn_mma_fp4_mma(float * const d, const uint32_t (&a)[4], const uint32_t sfa,
+        const uint32_t b0, const uint32_t b1, const uint32_t sfb) {
+#if defined(BLACKWELL_MMA_AVAILABLE) && defined(GGML_CUDA_FA_NVFP4_TC)
+    const uint16_t z = 0;
+    asm("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(z), "h"(z), "r"(sfb), "h"(z), "h"(z));
+#else
+    GGML_UNUSED_VARS(d, a, sfa, b0, b1, sfb);
+    NO_DEVICE_CODE;
+#endif // defined(BLACKWELL_MMA_AVAILABLE) && defined(GGML_CUDA_FA_NVFP4_TC)
+}
+
+static constexpr __host__ __device__ bool fattn_mma_nvfp4_tc_enabled() {
+#ifdef GGML_CUDA_FA_NVFP4_TC
+    return true;
+#else
+    return false;
+#endif // GGML_CUDA_FA_NVFP4_TC
+}
 
 template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
@@ -1008,6 +1059,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool kv_nvfp4        = std::is_same_v<T_KV2, block_nvfp4>;
     constexpr bool kv_conv         = fattn_mma_kv_conv_v<T_KV2>;
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse, kv_conv);
+    constexpr bool kv_tc           = kv_nvfp4 && vsplit && fattn_mma_nvfp4_tc_enabled(); // FP4 tensor core KQ
     static_assert(!kv_nvfp4 || (nbatch_K2 % (QK_NVFP4/2) == 0 && nbatch_V2 % (QK_NVFP4/2) == 0 && DKQ % QK_NVFP4 == 0 && DV % QK_NVFP4 == 0 &&
         !V_is_K_view), "bad NVFP4 K/V configuration");
 
@@ -1147,6 +1199,29 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         } else {
             constexpr int stride_tile_Q = vsplit ? DKQp/2 : DKQp/2 + 4;
+            if constexpr (kv_tc) {
+                static_assert(nbatch_K2 == QK_NVFP4/2 && T_B_KQ::I == 16 && T_A_KQ::I == 16, "bad FP4 KQ tiles");
+                const int    g  = threadIdx.x / 4;
+                const int    c  = threadIdx.x % 4;
+                const char * tQ = (const char *) tile_Q + ((threadIdx.y / np)*T_B_KQ::I)*fattn_mma_tc_stride_Q + (k0_start/nbatch_K2)*sizeof(block_nvfp4);
+                uint32_t a[4];
+                a[0] = *(const uint32_t *) (tQ +  g     *fattn_mma_tc_stride_Q +      4*c);
+                a[1] = *(const uint32_t *) (tQ + (g + 8)*fattn_mma_tc_stride_Q +      4*c);
+                a[2] = *(const uint32_t *) (tQ +  g     *fattn_mma_tc_stride_Q + 16 + 4*c);
+                a[3] = *(const uint32_t *) (tQ + (g + 8)*fattn_mma_tc_stride_Q + 16 + 4*c);
+                const uint32_t sfa = *(const uint32_t *) (tQ + (g + 8*(threadIdx.x % 2))*fattn_mma_tc_stride_Q + 32);
+                const char * tK = (const char *) tile_K_cur;
+#pragma unroll
+                for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
+                    const int i_KQ_0 = i_KQ_00 + (threadIdx.y % np)*T_A_KQ::I;
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const char * row = tK + (i_KQ_0 + 8*h + g)*fattn_mma_tc_stride_K;
+                        fattn_mma_fp4_mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)].x + 4*h, a, sfa,
+                            *(const uint32_t *) (row + 4*c), *(const uint32_t *) (row + 16 + 4*c), *(const uint32_t *) (row + 32));
+                    }
+                }
+            } else {
 #pragma unroll
             for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
                 if constexpr (vsplit) {
@@ -1182,9 +1257,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     }
                 }
             }
+            }
         }
 
-        if constexpr (pipe && kv_conv) {
+        if constexpr (kv_tc) {
+            if (k0_start > 0) {
+                stage.store_raw(tile_KV_nxt); // next chunk: K
+            } else {
+                stage.store(tile_KV_nxt);
+            }
+        } else if constexpr (pipe && kv_conv) {
             stage.store(tile_KV_nxt);
         }
         if constexpr (nstages <= 1 && !pipe) {
@@ -1628,8 +1710,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 
         if constexpr (pipe && kv_conv) {
-            if (i0_stop < DVp || !last_iter) {
+            if (i0_stop < DVp) {
                 stage.store(tile_KV_nxt);
+            } else if (!last_iter) {
+                if constexpr (kv_tc) {
+                    stage.store_raw(tile_KV_nxt); // first K chunk of the next KV iteration
+                } else {
+                    stage.store(tile_KV_nxt);
+                }
             }
         }
         if constexpr (nstages <= 1 && !pipe) {
@@ -1864,6 +1952,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int stride_tile_KV_max = stride_tile_K > stride_tile_V ? stride_tile_K : stride_tile_V;
     constexpr bool pipe = ggml_cuda_fattn_mma_get_pipe(DKQ, DV, ncols1, ncols2, use_sparse, V_is_K_view);
     constexpr bool kv_conv = fattn_mma_kv_conv_v<T_KV2>;
+    constexpr bool kv_tc   = std::is_same_v<T_KV2, block_nvfp4> && vsplit && fattn_mma_nvfp4_tc_enabled();
 
     extern __shared__ half2 tile_Q[];
     half2 * tile_K    = Q_in_reg                      ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
@@ -1939,6 +2028,59 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     __syncthreads();
 
+#ifdef GGML_CUDA_FA_NVFP4_TC
+    if constexpr (kv_tc) {
+        // Quantize the f16 Q tile to NVFP4 in place (column jc at jc*fattn_mma_tc_stride_Q bytes, one block per 64 values),
+        //     16 columns per pass: the NVFP4 data of a pass only overwrites f16 columns of this or earlier passes.
+        static_assert(ncols % 16 == 0 && (16*DKQ/QK_NVFP4_SUB) % (nwarps*warp_size) == 0, "bad FP4 Q tile");
+        constexpr int nsub = 16*DKQ/QK_NVFP4_SUB/(nwarps*warp_size); // sub-blocks per thread and pass
+        char * const tQ = (char *) tile_Q;
+#pragma unroll
+        for (int jc0 = 0; jc0 < ncols; jc0 += 16) {
+            uint8_t  sc[nsub];
+            uint32_t q[nsub][2];
+#pragma unroll
+            for (int is = 0; is < nsub; ++is) {
+                const int isub = is*nwarps*warp_size + threadIdx.y*warp_size + threadIdx.x;
+                const int jc   = jc0 + isub / (DKQ/QK_NVFP4_SUB);
+                const int sb   = isub % (DKQ/QK_NVFP4_SUB);
+                float x[QK_NVFP4_SUB];
+                float amax = 0.0f;
+#pragma unroll
+                for (int l = 0; l < QK_NVFP4_SUB/2; ++l) {
+                    const float2 v = __half22float2(tile_Q[swizzle<stride_tile_Q, half2>(jc*stride_tile_Q + sb*(QK_NVFP4_SUB/2) + l, jc)]);
+                    x[2*l + 0] = v.x;
+                    x[2*l + 1] = v.y;
+                    amax = fmaxf(amax, fmaxf(fabsf(v.x), fabsf(v.y)));
+                }
+                sc[is] = fp32_to_ue4m3_ref(amax / 6.0f);
+                const float d = ggml_cuda_ue4m3_to_fp32(sc[is]);
+                q[is][0] = 0;
+                q[is][1] = 0;
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    float e2;
+                    const uint32_t lo = quantize_f32_nvfp4_code(x[l],     d, e2);
+                    const uint32_t hi = quantize_f32_nvfp4_code(x[l + 8], d, e2);
+                    q[is][l/4] |= (lo | (hi << 4)) << (8*(l % 4));
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int is = 0; is < nsub; ++is) {
+                const int isub = is*nwarps*warp_size + threadIdx.y*warp_size + threadIdx.x;
+                const int jc   = jc0 + isub / (DKQ/QK_NVFP4_SUB);
+                const int sb   = isub % (DKQ/QK_NVFP4_SUB);
+                char * const blk = tQ + jc*fattn_mma_tc_stride_Q + (sb/4)*sizeof(block_nvfp4);
+                *(uint32_t *) (blk + (sb%4)*8 + 0) = q[is][0]; // blocks are 36 bytes: only 4 byte alignment
+                *(uint32_t *) (blk + (sb%4)*8 + 4) = q[is][1];
+                blk[32 + sb%4] = sc[is];
+            }
+            __syncthreads();
+        }
+    }
+#endif // GGML_CUDA_FA_NVFP4_TC
+
     if (Q_in_reg) {
         const int j0 = (threadIdx.y / np) * cols_per_warp;
 
@@ -2009,8 +2151,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr int k0_start_first = (DKQp/2-1) - (DKQp/2-1) % nbatch_K2;
         flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
             (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
-        flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, !kv_conv, false, false>
-            (fattn_mma_kv_offset(K_h2, k0_start_first), tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, nbatch_fa, indices);
+        if constexpr (kv_tc) {
+            fattn_mma_nvfp4_stage<stride_tile_K, nwarps, nbatch_fa, nbatch_K2> st;
+            st.fetch(fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, kb0*nbatch_fa, indices);
+            st.store_raw(tile_K);
+        } else {
+            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, !kv_conv, false, false>
+                (fattn_mma_kv_offset(K_h2, k0_start_first), tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, nbatch_fa, indices);
+        }
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
