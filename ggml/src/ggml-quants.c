@@ -378,20 +378,6 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
     }
 }
 
-// NVFP4 sub-block with the given UE4M3 scale code: E2M1 codes (nearest value, ties to the lower code) and the squared error.
-static float nvfp4_quantize_sub(const float * GGML_RESTRICT xb, const uint8_t ue, uint8_t * GGML_RESTRICT q) {
-    const float d = ggml_ue4m3_to_fp32(ue);
-    float sse = 0.0f;
-    for (int j = 0; j < QK_NVFP4_SUB; ++j) {
-        q[j] = best_index_mxfp4(xb[j], d);
-        const float e = kvalues_mxfp4[q[j]]*d - xb[j];
-        sse += e*e;
-    }
-    return sse;
-}
-
-// "Four over six" adaptive block scaling: per 16 values, scale the absmax to 6 (max E2M1 value) or to 4 and keep the one
-// with the lower squared error. Scaling to 4 gives the values near the absmax a finer grid (no 4 -> 6 gap).
 void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
@@ -412,18 +398,16 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
                 }
             }
 
-            uint8_t q6[QK_NVFP4_SUB];
-            uint8_t q4[QK_NVFP4_SUB];
-            const uint8_t ue6 = ggml_fp32_to_ue4m3(amax / 6.0f);
-            const uint8_t ue4 = ggml_fp32_to_ue4m3(amax / 4.0f);
-            const float sse6 = nvfp4_quantize_sub(xb, ue6, q6);
-            const float sse4 = nvfp4_quantize_sub(xb, ue4, q4);
-            const bool use4 = sse4 < sse6;
-            const uint8_t * q = use4 ? q4 : q6;
+            // UE4M3 scale: amax / 6.0 maps the max E2M1 value (6.0) to amax
+            const uint8_t ue = ggml_fp32_to_ue4m3(amax / 6.0f);
+            y[i].d[s] = ue;
+            const float d = ggml_ue4m3_to_fp32(ue);
 
-            y[i].d[s] = use4 ? ue4 : ue6;
             for (int j = 0; j < qk_sub/2; ++j) {
-                y[i].qs[s*(qk_sub/2) + j] = q[j] | (q[qk_sub/2 + j] << 4);
+                const uint8_t x0 = best_index_mxfp4(xb[0        + j], d);
+                const uint8_t x1 = best_index_mxfp4(xb[qk_sub/2 + j], d);
+
+                y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4);
             }
         }
     }

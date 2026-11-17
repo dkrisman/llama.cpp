@@ -111,7 +111,7 @@ static void set_rows_cuda_quant(
 }
 
 // NVFP4: 4 lanes per 16 value sub-block (16 per block_nvfp4), see quantize_f32_nvfp4_sub_x4.
-template <typename idx_t>
+template <typename idx_t, bool four_over_six>
 static __global__ void k_set_rows_nvfp4(const float * __restrict__ src0,
                                         const idx_t * __restrict__ src1,
                                         block_nvfp4 * __restrict__ dst,
@@ -153,7 +153,7 @@ static __global__ void k_set_rows_nvfp4(const float * __restrict__ src0,
     const float * src_sub   = src0 + i01*s01 + i02*s02 + i03*s03 + i00 + sub*QK_NVFP4_SUB;
     block_nvfp4 * dst_block = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_nvfp4) + i00/QK_NVFP4;
 
-    quantize_f32_nvfp4_sub_x4(src_sub, dst_block, sub, valid);
+    quantize_f32_nvfp4_sub_x4<four_over_six>(src_sub, dst_block, sub, valid);
 }
 
 template<typename idx_t>
@@ -170,7 +170,12 @@ static void set_rows_cuda_nvfp4(
     const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
 
     if (ne_total > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
-        k_set_rows_nvfp4<idx_t><<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
+        static const bool four_over_six = [] {
+            const char * env = getenv("GGML_CUDA_NVFP4_FOUR_OVER_SIX");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        auto kernel = four_over_six ? k_set_rows_nvfp4<idx_t, true> : k_set_rows_nvfp4<idx_t, false>;
+        kernel<<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
             src0_d, src1_d, dst_d, ne_total,
             nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float),
             nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t),

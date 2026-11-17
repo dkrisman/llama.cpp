@@ -237,9 +237,13 @@ static __device__ __forceinline__ uint32_t quantize_f32_nvfp4_code(const float v
     return v < 0.0f && best_m > 0 ? 8 + best_m : best_m;
 }
 
-// One 16 value sub-block of quantize_row_nvfp4_ref ("four over six": absmax scaled to 6 or 4, lower squared error),
+// One 16 value sub-block of quantize_row_nvfp4_ref (UE4M3 scale amax/6, nearest E2M1 value, ties to the lower code),
 //     computed by a group of 4 consecutive lanes (lane t: values 4t..4t+3). All 4 lanes must call it (valid == false:
-//     no memory accesses). The squared errors are summed in the order of the CPU reference by lane 0 of the group.
+//     no memory accesses).
+// four_over_six (opt-in, GGML_CUDA_NVFP4_FOUR_OVER_SIX=1, not the CPU reference): also try the absmax scaled to 4 and keep
+//     the lower squared error (summed in j order by lane 0). Lower MSE, but worse for Gemma 4 26B-A4B K/V in practice
+//     (first-token probabilities and AA-LCR thinking starts drift from f16 more than with amax/6).
+template <bool four_over_six>
 static __device__ __forceinline__ void quantize_f32_nvfp4_sub_x4(
         const float * __restrict__ xb, block_nvfp4 * __restrict__ y, const int s, const bool valid) {
     const int t = threadIdx.x % 4;
@@ -266,23 +270,28 @@ static __device__ __forceinline__ void quantize_f32_nvfp4_sub_x4(
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
         c6 |= quantize_f32_nvfp4_code(x[k], d6, e6[k]) << (8*k);
-        c4 |= quantize_f32_nvfp4_code(x[k], d4, e4[k]) << (8*k);
-    }
-
-    // sequential sums over j = 0..15 in lane 0 of the group
-    float sse6 = 0.0f;
-    float sse4 = 0.0f;
-#pragma unroll
-    for (int src = 0; src < 4; ++src) {
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const float a6 = __shfl_sync(0xFFFFFFFF, e6[k], src, 4);
-            const float a4 = __shfl_sync(0xFFFFFFFF, e4[k], src, 4);
-            sse6 = __fadd_rn(sse6, a6);
-            sse4 = __fadd_rn(sse4, a4);
+        if constexpr (four_over_six) {
+            c4 |= quantize_f32_nvfp4_code(x[k], d4, e4[k]) << (8*k);
         }
     }
-    const bool use4 = __shfl_sync(0xFFFFFFFF, sse4 < sse6, 0, 4);
+
+    bool use4 = false;
+    if constexpr (four_over_six) {
+        // sequential sums over j = 0..15 in lane 0 of the group
+        float sse6 = 0.0f;
+        float sse4 = 0.0f;
+#pragma unroll
+        for (int src = 0; src < 4; ++src) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float a6 = __shfl_sync(0xFFFFFFFF, e6[k], src, 4);
+                const float a4 = __shfl_sync(0xFFFFFFFF, e4[k], src, 4);
+                sse6 = __fadd_rn(sse6, a6);
+                sse4 = __fadd_rn(sse4, a4);
+            }
+        }
+        use4 = __shfl_sync(0xFFFFFFFF, sse4 < sse6, 0, 4);
+    }
     const uint32_t c  = use4 ? c4 : c6;
     // byte j (j < 8) of qs = code j | code (j + 8) << 4: lanes 0/1 hold codes 0..7, lanes 2/3 codes 8..15
     const uint32_t hi = __shfl_down_sync(0xFFFFFFFF, c, 2, 4);
