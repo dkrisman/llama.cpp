@@ -308,18 +308,10 @@ llama_kv_cache::llama_kv_cache(
                     model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");
         }
 
-        // NVFP4 (16 value blocks, FP8 scales) skips the rotation unless LLAMA_ATTN_ROT_NVFP4=1: the fine block
-        //   scales already absorb outliers and the fwht kernels cost decode time
-        const char * env_rot_nvfp4 = getenv("LLAMA_ATTN_ROT_NVFP4");
-        const bool   rot_nvfp4     = env_rot_nvfp4 != nullptr && atoi(env_rot_nvfp4) != 0;
-        auto rot_type = [&](ggml_type t) {
-            return ggml_is_quantized(t) && (t != GGML_TYPE_NVFP4 || rot_nvfp4);
-        };
-
         bool attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
-            rot_type(type_k) &&
+            ggml_is_quantized(type_k) &&
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
@@ -333,7 +325,7 @@ llama_kv_cache::llama_kv_cache(
         const bool attn_rot_v =
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
-            rot_type(type_v) &&
+            ggml_is_quantized(type_v) &&
             hparams.n_embd_head_v() % 64 == 0;
 
         if (attn_rot_k) {
