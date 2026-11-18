@@ -613,6 +613,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(F8_E4M3, F8_E4M3)
 
     FATTN_VEC_CASES_ALL_D(NVFP4, NVFP4)
+    FATTN_VEC_CASES_ALL_D(F8_E4M3, NVFP4)
 
     return nullptr;
 }
