@@ -984,6 +984,28 @@ static __device__ __forceinline__ void fattn_mma_tc_convert_V(const char * const
     }
 }
 
+// Chunk pipeline: prefetch the K or V rows (DKV values each) of a KV iteration into L2, one prefetch per 128 byte line.
+//     The chunk loads of that iteration then hit L2 instead of DRAM. No shared memory and no registers are needed.
+//     Only for NVFP4 V and long K/V (fattn_mma_l2_prefetch_min_kv): when K/V of a layer fits into L2 anyway, or for FP8 K/V,
+//     the extra instructions cost more than they save (D=512 nb 2048: kv 34816 f8 +12%, nvfp4 +5%; kv 116736 nvfp4 -10%,
+//     FP8 K + NVFP4 V -21%, f8 +0%).
+static constexpr int fattn_mma_l2_prefetch_min_kv = 65536;
+template<int nwarps, int nbatch_fa, int DKV, typename T_KV2>
+static __device__ __forceinline__ void fattn_mma_prefetch_rows_l2(const T_KV2 * const __restrict__ KV, const int stride_KV, const int k0) {
+    constexpr int row_bytes = int(sizeof(T_KV2)) * (DKV/2) / fattn_mma_kv_pairs_v<T_KV2>;
+    constexpr int lines     = (row_bytes + 127)/128 + 1; // + 1: rows are not line aligned
+    // Not unrolled and with the base hidden from the compiler: the kernel is at 255 registers.
+    const char * base = (const char *) (KV + int64_t(k0)*stride_KV);
+    asm volatile("" : "+l"(base));
+    const int64_t stride_b = int64_t(stride_KV)*sizeof(T_KV2);
+#pragma unroll 1
+    for (int i = threadIdx.y*WARP_SIZE + threadIdx.x; i < nbatch_fa*lines; i += nwarps*WARP_SIZE) {
+        const int row = i / lines;
+        const int l   = i - row*lines;
+        asm volatile("prefetch.global.L2 [%0];" : : "l"(base + row*stride_b + min(l*128, row_bytes - 1)));
+    }
+}
+
 template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
@@ -1101,7 +1123,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int jt,
         const int kb0,
         const int kb0_next,
-        const int k_VKQ_sup) {
+        const int k_VKQ_sup,
+        const bool l2_prefetch) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
@@ -1197,7 +1220,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (kv_tc) {
             char * const slot = (char *) tile_K + (c % fattn_mma_tc_nslots)*tc_slot_bytes;
             const int    cc   = c % nchunks_tc;
-            const int    kv0  = c < nchunks_tc ? k_VKQ_0 : k_VKQ_0 + nbatch_fa;
+            const int    kv0  = c < nchunks_tc ? k_VKQ_0 : kb0_next*nbatch_fa;
             if (c < nchunks_tc || !last_iter) {
                 if (cc < nchunks_K) {
                     fattn_mma_tc_load_chunk<nwarps, nbatch_fa>(slot, fattn_mma_kv_offset(K_h2, k0_start_first - cc*nbatch_K2), stride_K, kv0, indices);
@@ -1207,7 +1230,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
             if (c == nchunks_K + 3 && !last_iter) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
-                    (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
+                    (mask_h, tile_mask, stride_mask, kb0_next*nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
             }
             cp_async_commit_group();
         } else {
@@ -1265,6 +1288,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             __syncthreads();
             tc_issue(ic_K + 3);
         } else if constexpr (pipe) {
+#ifndef GGML_CUDA_FA_NO_L2_PREFETCH
+            // FP8 K + NVFP4 V: always (kv 34816 +0%, kv 116736 -21%); NVFP4 K/V: long K/V only; FP8 K/V: never.
+            if (ic_K == 0 && !last_iter && !indices && ((k_f8 && v_nvfp4) || (k_nvfp4 && v_nvfp4 && l2_prefetch))) {
+                fattn_mma_prefetch_rows_l2<nwarps, nbatch_fa, DKQ>(K_h2, stride_K, kb0_next*nbatch_fa);
+                fattn_mma_prefetch_rows_l2<nwarps, nbatch_fa, DV >(V_h2, stride_V, kb0_next*nbatch_fa);
+            }
+#endif // GGML_CUDA_FA_NO_L2_PREFETCH
             cp_async_wait_all(); // Current chunk (f16) and mask.
             __syncthreads();     // Current chunk visible, all warps are done with the previous chunk whose buffer is reused.
             if (k0_start > 0) {
@@ -1755,8 +1785,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     pipe_load_chunk(stage, fattn_mma_kv_offset(V_h2, i0_stop/2), stride_V, k_VKQ_0, tile_KV_nxt);
                 } else if (!last_iter) {
                     flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
-                        (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
-                    pipe_load_chunk(stage_kn, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, k_VKQ_0 + nbatch_fa, tile_KV_nxt);
+                        (mask_h, tile_mask, stride_mask, kb0_next*nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
+                    pipe_load_chunk(stage_kn, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, kb0_next*nbatch_fa, tile_KV_nxt);
                 }
             }
         } else if constexpr (pipe) {
@@ -1767,8 +1797,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             } else if (!last_iter) {
                 // Prefetch mask and first K chunk of the next KV iteration, all warps are done with the softmax.
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
-                    (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
-                pipe_load_chunk(stage_kn, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, k_VKQ_0 + nbatch_fa, tile_KV_nxt);
+                    (mask_h, tile_mask, stride_mask, kb0_next*nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
+                pipe_load_chunk(stage_kn, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, kb0_next*nbatch_fa, tile_KV_nxt);
             }
         } else if constexpr (nstages <= 1) {
             const int i0_diff = min(i0_stop, DV) - i0_start; // Only load the real head size from global memory.
@@ -2327,6 +2357,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
     }
 
+    // Chunk pipeline: L2 prefetch of the next KV iteration for long K/V, see fattn_mma_prefetch_rows_l2.
+    const bool l2_prefetch = !indices && ne11 >= fattn_mma_l2_prefetch_min_kv;
+
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
     if constexpr (nstages > 1) {
         constexpr bool oob_check = false;
@@ -2339,7 +2372,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, kb0_next, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, kb0_next, k_VKQ_sup, l2_prefetch);
             kb0 = kb0_next;
         }
         constexpr bool last_iter = true;
@@ -2349,7 +2382,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup);
+             KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup, l2_prefetch);
     } else if constexpr (ncols2 == 1 || use_sparse) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
@@ -2360,7 +2393,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, kb0 + 1, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, kb0 + 1, k_VKQ_sup, l2_prefetch);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
@@ -2369,7 +2402,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup);
+             KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup, l2_prefetch);
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
@@ -2380,7 +2413,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, kb0 + 1, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, kb0 + 1, k_VKQ_sup, l2_prefetch);
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
@@ -2389,7 +2422,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup);
+             KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup, l2_prefetch);
     }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
