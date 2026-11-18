@@ -3017,7 +3017,9 @@ static __global__ void flash_attn_ext_f16(
 
     // Rotate the K/V block order: kbc uses K/V block (kbc - kbc_tile) % iter_k instead of kbc % iter_k, kbc_tile is the start of the CUDA block that started the tile.
     // Then concurrent CUDA blocks use the same K/V blocks and can share them in L2. Only with multi-stage loading, else they all wait for the same K/V data.
-    constexpr bool rotate = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse) > 1;
+    // FP8/NVFP4 K/V run with at most 1 stage (kv_conv), so they never rotate.
+    constexpr bool rotate = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse,
+        fattn_mma_kv_conv_v<T_K2> || fattn_mma_kv_conv_v<T_V2>) > 1;
     const int kbc0     = kbc;
     int       kbc_tile = kbc;
     if (rotate && kb0_start != 0) {
