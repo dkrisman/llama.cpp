@@ -2121,7 +2121,26 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                         amax = fmaxf(amax, fabsf(x[l]));
                     }
                 }
-                const uint8_t sc = fp32_to_ue4m3_ref(amax / 6.0f);
+                uint8_t sc = fp32_to_ue4m3_ref(amax / 6.0f);
+#ifdef GGML_CUDA_FA_NVFP4_TC_Q46
+                // four-over-six for the residual term: also try the absmax scaled to 4, keep the lower squared error
+                if (iq == 1) {
+                    const uint8_t sc4 = fp32_to_ue4m3_ref(amax / 4.0f);
+                    const float   d6  = ggml_cuda_ue4m3_to_fp32(sc);
+                    const float   d4  = ggml_cuda_ue4m3_to_fp32(sc4);
+                    float sse6 = 0.0f;
+                    float sse4 = 0.0f;
+#pragma unroll
+                    for (int l = 0; l < QK_NVFP4_SUB; ++l) {
+                        float e2;
+                        quantize_f32_nvfp4_code(x[l], d6, e2);
+                        sse6 += e2;
+                        quantize_f32_nvfp4_code(x[l], d4, e2);
+                        sse4 += e2;
+                    }
+                    sc = sse4 < sse6 ? sc4 : sc;
+                }
+#endif // GGML_CUDA_FA_NVFP4_TC_Q46
                 const float   d  = ggml_cuda_ue4m3_to_fp32(sc);
                 uint32_t q[2] = {0, 0};
 #pragma unroll
