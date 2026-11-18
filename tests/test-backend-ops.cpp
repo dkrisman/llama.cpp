@@ -13126,6 +13126,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 1024, 75, true, false, 0, 30.0f, GGML_PREC_F32, fp4, fp4));
+        // FP8 K with NVFP4 V: vector kernel for decode, K/V converted to f16 for the MMA kernel
+        for (int hs : {256, 512}) {
+            const int nr2 = hs == 512 ? 8 : 2;
+            for (int nb : {1, 2, 4, 256}) {
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, fp4));
+            }
+        }
         // head size 512, GQA 8, prompt batch (Blackwell chunk pipeline + V split)
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 1024, 256, true, true,  0, 0,     GGML_PREC_F32, fp4, fp4));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 1024, 256, true, false, 0, 30.0f, GGML_PREC_F32, fp4, fp4));
