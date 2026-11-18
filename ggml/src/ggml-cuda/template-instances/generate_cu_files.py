@@ -41,6 +41,8 @@ SOURCE_FATTN_MMA_F8_CASE = "DECL_FATTN_MMA_F8_CASE({head_size_kq}, {head_size_v}
 
 # MMA kernel reading NVFP4 K/V natively, same head sizes as FP8 (keep in sync with fattn.cu):
 SOURCE_FATTN_MMA_NVFP4_CASE = "DECL_FATTN_MMA_NVFP4_CASE({head_size_kq}, {head_size_v}, {ncols1}, {ncols2});\n"
+# MMA kernel reading FP8 K + NVFP4 V natively, same instances as NVFP4:
+SOURCE_FATTN_MMA_F8_NVFP4_CASE = "DECL_FATTN_MMA_F8_NVFP4_CASE({head_size_kq}, {head_size_v}, {ncols1}, {ncols2});\n"
 
 TYPES_MMQ = [
     "GGML_TYPE_Q1_0",
@@ -129,6 +131,14 @@ for ncols in [8, 16, 32, 64]:
                 if head_size_kq == 512 and ncols2 not in (2, 4, 8): # Gemma 4 (+ MTP)
                     continue
                 f.write(SOURCE_FATTN_MMA_NVFP4_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_kq))
+
+        with open(f"fattn-mma-f8nvfp4-instance-ncols1_{ncols1}-ncols2_{ncols2}.cu", "w") as f:
+            f.write(SOURCE_FATTN_MMA_START)
+
+            for head_size_kq in HEAD_SIZES_KQ_MMA_F8:
+                if head_size_kq == 512 and ncols2 not in (2, 4, 8): # Gemma 4 (+ MTP)
+                    continue
+                f.write(SOURCE_FATTN_MMA_F8_NVFP4_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_kq))
 
 for type in TYPES_MMQ:
     with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:

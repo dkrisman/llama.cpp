@@ -510,10 +510,14 @@ struct fattn_mma_kv_f8x2 {
 static constexpr int FATTN_MMA_KV_F16   = 0;
 static constexpr int FATTN_MMA_KV_F8    = 1;
 static constexpr int FATTN_MMA_KV_NVFP4 = 2;
+static constexpr int FATTN_MMA_KV_F8_NVFP4 = 3; // FP8 K, NVFP4 V
 
 template <int kv_fmt>
-using fattn_mma_kv2_t = std::conditional_t<kv_fmt == FATTN_MMA_KV_F8, fattn_mma_kv_f8x2,
-                        std::conditional_t<kv_fmt == FATTN_MMA_KV_NVFP4, block_nvfp4, half2>>;
+using fattn_mma_k2_t = std::conditional_t<kv_fmt == FATTN_MMA_KV_F8 || kv_fmt == FATTN_MMA_KV_F8_NVFP4, fattn_mma_kv_f8x2,
+                       std::conditional_t<kv_fmt == FATTN_MMA_KV_NVFP4, block_nvfp4, half2>>;
+template <int kv_fmt>
+using fattn_mma_v2_t = std::conditional_t<kv_fmt == FATTN_MMA_KV_F8, fattn_mma_kv_f8x2,
+                       std::conditional_t<kv_fmt == FATTN_MMA_KV_NVFP4 || kv_fmt == FATTN_MMA_KV_F8_NVFP4, block_nvfp4, half2>>;
 
 // K/V that is converted to f16 while loading it into shared memory (no cp.async).
 template <typename T_KV2>
@@ -1069,11 +1073,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
-    typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ, typename T_KV2>
+    typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ, typename T_K2, typename T_V2>
 static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const float2 * const __restrict__ Q_f2,
-        const T_KV2  * const __restrict__ K_h2,
-        const T_KV2  * const __restrict__ V_h2,
+        const T_K2   * const __restrict__ K_h2,
+        const T_V2   * const __restrict__ V_h2,
         const half   * const __restrict__ mask_h,
         const int32_t * const __restrict__ indices,
         float2       * const __restrict__ dstk,
@@ -1108,11 +1112,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_K2       = vsplit ? fattn_mma_vsplit_nbatch_KV2 : ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = vsplit ? fattn_mma_vsplit_nbatch_KV2 : ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
-    constexpr bool kv_f8           = std::is_same_v<T_KV2, fattn_mma_kv_f8x2>;
-    constexpr bool kv_nvfp4        = std::is_same_v<T_KV2, block_nvfp4>;
-    constexpr bool kv_conv         = fattn_mma_kv_conv_v<T_KV2>;
+    constexpr bool k_f8            = std::is_same_v<T_K2, fattn_mma_kv_f8x2>;
+    constexpr bool v_f8            = std::is_same_v<T_V2, fattn_mma_kv_f8x2>;
+    constexpr bool k_nvfp4         = std::is_same_v<T_K2, block_nvfp4>;
+    constexpr bool v_nvfp4         = std::is_same_v<T_V2, block_nvfp4>;
+    constexpr bool kv_nvfp4        = k_nvfp4 || v_nvfp4;
+    constexpr bool k_conv          = fattn_mma_kv_conv_v<T_K2>;
+    constexpr bool v_conv          = fattn_mma_kv_conv_v<T_V2>;
+    constexpr bool kv_conv         = k_conv || v_conv;
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse, kv_conv);
-    constexpr bool kv_tc           = kv_nvfp4 && vsplit && fattn_mma_nvfp4_tc_enabled(); // FP4 tensor core KQ
+    constexpr bool kv_tc           = k_nvfp4 && v_nvfp4 && vsplit && fattn_mma_nvfp4_tc_enabled(); // FP4 tensor core KQ
     static_assert(!kv_nvfp4 || (nbatch_K2 % (QK_NVFP4/2) == 0 && nbatch_V2 % (QK_NVFP4/2) == 0 && DKQ % QK_NVFP4 == 0 && DV % QK_NVFP4 == 0 &&
         !V_is_K_view), "bad NVFP4 K/V configuration");
 
@@ -1133,16 +1142,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         "chunk pipeline needs uniform chunks");
     static_assert(!pipe || !oob_check, "chunk pipeline incompatible with OOB check");
     struct pipe_stage_none {};
-    using pipe_stage_t = std::conditional_t<pipe && kv_f8,    fattn_mma_f8_stage   <stride_tile_K, nwarps, nbatch_fa, nbatch_K2>,
-                         std::conditional_t<pipe && kv_nvfp4, fattn_mma_nvfp4_stage<stride_tile_K, nwarps, nbatch_fa, nbatch_K2>, pipe_stage_none>>;
+    using pipe_stage_K_t = std::conditional_t<pipe && k_f8,    fattn_mma_f8_stage   <stride_tile_K, nwarps, nbatch_fa, nbatch_K2>,
+                           std::conditional_t<pipe && k_nvfp4, fattn_mma_nvfp4_stage<stride_tile_K, nwarps, nbatch_fa, nbatch_K2>, pipe_stage_none>>;
+    using pipe_stage_V_t = std::conditional_t<pipe && v_f8,    fattn_mma_f8_stage   <stride_tile_V, nwarps, nbatch_fa, nbatch_V2>,
+                           std::conditional_t<pipe && v_nvfp4, fattn_mma_nvfp4_stage<stride_tile_V, nwarps, nbatch_fa, nbatch_V2>, pipe_stage_none>>;
     // Starts loading the chunk at KV + KV row offset k_VKQ_0_chunk into tile_dst (f16: cp.async, FP8/NVFP4: into registers, see store).
-    auto pipe_load_chunk = [&] __device__ (pipe_stage_t & stage, const T_KV2 * const KV_chunk, const int stride_KV, const int k_VKQ_0_chunk,
+    // K and V may differ in type (FP8 K + NVFP4 V): the stage type follows the chunk.
+    auto pipe_load_chunk = [&] __device__ (auto & stage, const auto * const KV_chunk, const int stride_KV, const int k_VKQ_0_chunk,
             half2 * const tile_dst) {
+        using T_chunk = std::remove_cv_t<std::remove_reference_t<decltype(*KV_chunk)>>;
+        constexpr bool kv_conv = fattn_mma_kv_conv_v<T_chunk>;
         if constexpr (pipe) {
             // Without a row index list, offset the base pointer by the first KV row and hide it from the compiler:
             //     this keeps it from creating separate pointer induction variables for every (unrolled) chunk and row,
             //     which costs a lot of registers.
-            const T_KV2 * KV_base = KV_chunk;
+            const T_chunk * KV_base = KV_chunk;
             int           k_base  = k_VKQ_0_chunk;
             if (!indices) {
                 KV_base = KV_chunk + int64_t(k_VKQ_0_chunk)*stride_KV;
@@ -1159,6 +1173,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         } else {
             GGML_UNUSED_VARS(stage, KV_chunk, stride_KV, k_VKQ_0_chunk, tile_dst);
+        }
+    };
+    // Converts and stores a register staged chunk (FP8/NVFP4), f16 chunks were loaded with cp.async.
+    auto pipe_store = [&] __device__ (const auto & stage, half2 * const tile_dst) {
+        if constexpr (!std::is_same_v<std::decay_t<decltype(stage)>, pipe_stage_none>) {
+            stage.store(tile_dst);
+        } else {
+            GGML_UNUSED_VARS(stage, tile_dst);
         }
     };
 
@@ -1197,7 +1219,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     half2 * const tile_P   = kv_tc ? tile_V + nbatch_fa*stride_tile_V : (nchunks_K - 1) % 2 == 1 ? tile_V : tile_K;
     half  * const tile_max = tile_mask + ncols1*(nbatch_fa + 8); // As half (rounded up) to fit 16 warps.
     static_assert(!vsplit || ncols*(nbatch_fa/2) <= nbatch_fa*stride_tile_V, "P does not fit into a chunk buffer");
-    pipe_stage_t stage_v0; // V split: staging of the second V chunk, its load is started before the V loop.
+    pipe_stage_V_t stage_v0; // V split: staging of the second V chunk, its load is started before the V loop.
     GGML_UNUSED_VARS(tile_P, tile_max, stage_v0);
 
 #if defined(TURING_MMA_AVAILABLE)
@@ -1235,7 +1257,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int     ic_K        = (k0_start_first - k0_start) / nbatch_K2; // Chunk index within the KV iteration.
         half2 * const tile_K_cur  = pipe && ic_K % 2 == 1 ? tile_V : tile_K;
         half2 * const tile_KV_nxt = pipe && ic_K % 2 == 1 ? tile_K : tile_V;
-        pipe_stage_t  stage;
+        pipe_stage_K_t stage_k; // next chunk: K
+        pipe_stage_V_t stage_v; // next chunk: the first V chunk
         if constexpr (kv_tc) {
             cp_async_wait_group<1>(); // Current and next chunk (the next one may be a V chunk to convert after this one).
             __syncthreads();
@@ -1244,13 +1267,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             cp_async_wait_all(); // Current chunk (f16) and mask.
             __syncthreads();     // Current chunk visible, all warps are done with the previous chunk whose buffer is reused.
             if (k0_start > 0) {
-                pipe_load_chunk(stage, fattn_mma_kv_offset(K_h2, k0_start - nbatch_K2), stride_K, k_VKQ_0, tile_KV_nxt);
+                pipe_load_chunk(stage_k, fattn_mma_kv_offset(K_h2, k0_start - nbatch_K2), stride_K, k_VKQ_0, tile_KV_nxt);
             } else {
-                pipe_load_chunk(stage, V_h2, stride_V, k_VKQ_0, tile_KV_nxt);
+                pipe_load_chunk(stage_v, V_h2, stride_V, k_VKQ_0, tile_KV_nxt);
             }
         } else if constexpr (nstages <= 1) {
             const int k0_diff = min(k0_stop, DKQ/2) - k0_start; // Only load the real head size from global memory.
-            constexpr bool use_cp_async = nstages == 1 && !kv_conv;
+            constexpr bool use_cp_async = nstages == 1 && !k_conv;
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (fattn_mma_kv_offset(K_h2, k0_start), tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
             if constexpr (nstages == 1) { // Also waits for the mask, which is loaded with cp_async even for FP8/NVFP4 K/V.
@@ -1332,7 +1355,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     T_A_KQ K_A;
                     // K_A is the B operand of the mma below, f16 K/V only: for FP8 K/V the different register allocation
                     //     made the kernel slower (13011 -> 13381 us at kv 34816), f16: 15392 -> 15099 us.
-                    if constexpr (vsplit && !kv_conv) {
+                    if constexpr (vsplit && !k_conv) {
                         load_ldmatrix_swizzled_bpair<stride_tile_K>(K_A, tile_K_cur, i_KQ_0*stride_tile_K + k_KQ_0-k0_start);
                     } else {
                         load_ldmatrix_swizzled<stride_tile_K>(K_A, tile_K_cur, i_KQ_0*stride_tile_K + k_KQ_0-k0_start);
@@ -1359,13 +1382,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if (ic_K == nchunks_K - 1) { // first V chunk -> f16 buffer 0
                 fattn_mma_tc_convert_V<stride_tile_V, nwarps, nbatch_fa>((const char *) tile_K + (nchunks_K % fattn_mma_tc_nslots)*tc_slot_bytes, tile_V);
             }
-        } else if constexpr (pipe && kv_conv) {
-            stage.store(tile_KV_nxt);
+        } else if constexpr (pipe) {
+            if (k0_start > 0) {
+                pipe_store(stage_k, tile_KV_nxt);
+            } else {
+                pipe_store(stage_v, tile_KV_nxt);
+            }
         }
         if constexpr (nstages <= 1 && !pipe) {
             __syncthreads(); // Only needed if tile_K == tile_V.
         }
-        GGML_UNUSED_VARS(stage, tile_KV_nxt);
+        GGML_UNUSED_VARS(stage_k, stage_v, tile_KV_nxt);
     }
 
     if (use_logit_softcap) {
@@ -1532,7 +1559,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
             // All warps are also done with the last K chunk, its buffer can be used for P.
             __syncthreads();
-            if constexpr (kv_conv && !kv_tc) { // Registers only, the store into the chunk buffer is after the first V chunk.
+            if constexpr (v_conv && !kv_tc) { // Registers only, the store into the chunk buffer is after the first V chunk.
                 pipe_load_chunk(stage_v0, fattn_mma_kv_offset(V_h2, nbatch_V2), stride_V, k_VKQ_0, tile_P);
             }
             // All np warps (including this one) use the same rounded values -> identical KQ max.
@@ -1678,7 +1705,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             cp_async_wait_all();
             __syncthreads();
         }
-        if constexpr (!kv_conv) {
+        if constexpr (!v_conv) {
             pipe_load_chunk(stage_v0, fattn_mma_kv_offset(V_h2, nbatch_V2), stride_V, k_VKQ_0, tile_P);
         }
     }
@@ -1710,8 +1737,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int     ic_V        = nchunks_K + i0_start/(2*nbatch_V2); // Chunk index within the KV iteration.
         half2 * const tile_V_cur  = kv_tc ? tile_V + (ic_V % 2)*(nbatch_fa*stride_tile_V) : !pipe || ic_V % 2 == 1 ? tile_V : tile_K;
         half2 * const tile_KV_nxt = ic_V % 2 == 1 ? tile_K : tile_V;
-        pipe_stage_t  stage_cur;
-        pipe_stage_t & stage = vsplit && i0_start == 0 ? stage_v0 : stage_cur;
+        pipe_stage_V_t  stage_cur;
+        pipe_stage_V_t & stage = vsplit && i0_start == 0 ? stage_v0 : stage_cur; // next chunk: V
+        pipe_stage_K_t  stage_kn;                                                 // next chunk: first K chunk of the next iteration
         if constexpr (vsplit) {
             if (i0_start == 0) {
                 // Synchronization and load of the next chunk were already done before the softmax.
@@ -1727,7 +1755,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 } else if (!last_iter) {
                     flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
                         (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
-                    pipe_load_chunk(stage, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, k_VKQ_0 + nbatch_fa, tile_KV_nxt);
+                    pipe_load_chunk(stage_kn, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, k_VKQ_0 + nbatch_fa, tile_KV_nxt);
                 }
             }
         } else if constexpr (pipe) {
@@ -1739,12 +1767,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 // Prefetch mask and first K chunk of the next KV iteration, all warps are done with the softmax.
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
                     (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
-                pipe_load_chunk(stage, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, k_VKQ_0 + nbatch_fa, tile_KV_nxt);
+                pipe_load_chunk(stage_kn, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, k_VKQ_0 + nbatch_fa, tile_KV_nxt);
             }
         } else if constexpr (nstages <= 1) {
             const int i0_diff = min(i0_stop, DV) - i0_start; // Only load the real head size from global memory.
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
-                constexpr bool use_cp_async = nstages == 1 && !kv_conv;
+                constexpr bool use_cp_async = nstages == 1 && !v_conv;
                 flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                     (fattn_mma_kv_offset(V_h2, i0_start/2), tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
                 if constexpr (nstages == 1) {
@@ -1817,15 +1845,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 fattn_mma_tc_convert_V<stride_tile_V, nwarps, nbatch_fa>(
                     (const char *) tile_K + ((ic_V + 1) % fattn_mma_tc_nslots)*tc_slot_bytes, tile_V + ((ic_V + 1) % 2)*(nbatch_fa*stride_tile_V));
             }
-        } else if constexpr (pipe && kv_conv) {
-            if (i0_stop < DVp || !last_iter) {
-                stage.store(tile_KV_nxt);
+        } else if constexpr (pipe) {
+            if (i0_stop < DVp) {
+                pipe_store(stage, tile_KV_nxt);
+            } else if (!last_iter) {
+                pipe_store(stage_kn, tile_KV_nxt);
             }
         }
         if constexpr (nstages <= 1 && !pipe) {
             __syncthreads(); // Only needed if tile_K == tile_V.
         }
-        GGML_UNUSED_VARS(stage, tile_KV_nxt);
+        GGML_UNUSED_VARS(stage, stage_kn, tile_KV_nxt);
     }
 #else
     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup,
@@ -1985,11 +2015,11 @@ template<int DKQ, int ncols> struct mma_tile_sizes {
 #endif // defined(TURING_MMA_AVAILABLE)
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup,
-    typename T_KV2>
+    typename T_K2, typename T_V2>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float2 * const __restrict__ Q_f2,
-        const T_KV2  * const __restrict__ K_h2,
-        const T_KV2  * const __restrict__ V_h2,
+        const T_K2   * const __restrict__ K_h2,
+        const T_V2   * const __restrict__ V_h2,
         const half   * const __restrict__ mask_h,
         const int32_t * const __restrict__ indices,
         const float  * const __restrict__ sinks_f,
@@ -2033,7 +2063,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, use_sparse,
-                                                                                 fattn_mma_kv_conv_v<T_KV2>);
+                                                                                 fattn_mma_kv_conv_v<T_K2> || fattn_mma_kv_conv_v<T_V2>);
 
     constexpr int DKQp = GGML_PAD(DKQ, 16);
     constexpr int DVp  = GGML_PAD(DV, 16);
@@ -2052,8 +2082,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
     constexpr int stride_tile_KV_max = stride_tile_K > stride_tile_V ? stride_tile_K : stride_tile_V;
     constexpr bool pipe = ggml_cuda_fattn_mma_get_pipe(DKQ, DV, ncols1, ncols2, use_sparse, V_is_K_view);
-    constexpr bool kv_conv = fattn_mma_kv_conv_v<T_KV2>;
-    constexpr bool kv_tc   = std::is_same_v<T_KV2, block_nvfp4> && vsplit && fattn_mma_nvfp4_tc_enabled();
+    constexpr bool k_conv  = fattn_mma_kv_conv_v<T_K2>;
+    constexpr bool kv_conv = k_conv || fattn_mma_kv_conv_v<T_V2>;
+    constexpr bool kv_tc   = std::is_same_v<T_K2, block_nvfp4> && std::is_same_v<T_V2, block_nvfp4> && vsplit && fattn_mma_nvfp4_tc_enabled();
 
     extern __shared__ half2 tile_Q[];
     half2 * tile_K    = Q_in_reg                      ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
@@ -2283,7 +2314,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 cp_async_commit_group();
             }
         } else {
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, !kv_conv, false, false>
+            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, !k_conv, false, false>
                 (fattn_mma_kv_offset(K_h2, k0_start_first), tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, nbatch_fa, indices);
         }
     }
@@ -2893,12 +2924,13 @@ static __global__ void flash_attn_ext_f16(
 
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
-    using T_KV2 = fattn_mma_kv2_t<kv_fmt>;
+    using T_K2 = fattn_mma_k2_t<kv_fmt>;
+    using T_V2 = fattn_mma_v2_t<kv_fmt>;
 
-    const int stride_K    = nb11 / sizeof(T_KV2);
+    const int stride_K    = nb11 / sizeof(T_K2);
     const int stride_mask = nb31 / sizeof(half);
 
-    const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(T_KV2);
+    const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(T_V2);
 
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
@@ -2930,12 +2962,12 @@ static __global__ void flash_attn_ext_f16(
         const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
-        const T_KV2  * K_h2   = (const T_KV2  *) (K + nb13*sequence + nb12*z_KV);
+        const T_K2   * K_h2   = (const T_K2   *) (K + nb13*sequence + nb12*z_KV);
         const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
             (const half *) (mask + nb33*(sequence % ne33));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
-        const T_KV2 * V_h2 = V_is_K_view ? K_h2 : (const T_KV2 *) (V + nb23*sequence + nb22*z_KV);
+        const T_V2 * V_h2 = V_is_K_view ? (const T_V2 *) K_h2 : (const T_V2 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
         const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 :
                                   KV_rows_ptr ? KV_rows_ptr + int64_t(sequence)*ne11 : nullptr;
@@ -2980,12 +3012,12 @@ static __global__ void flash_attn_ext_f16(
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
     const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
-    const T_KV2  * K_h2   = (const T_KV2  *) (K + nb13*sequence + nb12*z_KV);
+    const T_K2   * K_h2   = (const T_K2   *) (K + nb13*sequence + nb12*z_KV);
     const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
         (const half *) (mask + nb33*(sequence % ne33));
     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
-    const T_KV2 * V_h2 = V_is_K_view ? K_h2 : (const T_KV2 *) (V + nb23*sequence + nb22*z_KV);
+    const T_V2 * V_h2 = V_is_K_view ? (const T_V2 *) K_h2 : (const T_V2 *) (V + nb23*sequence + nb22*z_KV);
     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
     const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 :
                               KV_rows_ptr ? KV_rows_ptr + int64_t(sequence)*ne11 : nullptr;
@@ -3033,6 +3065,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     } else if constexpr (kv_fmt == FATTN_MMA_KV_NVFP4) {
         GGML_ASSERT(dst->src[1]->type == GGML_TYPE_NVFP4 && dst->src[2]->type == GGML_TYPE_NVFP4);
         GGML_ASSERT((uintptr_t) dst->src[1]->data % 4 == 0 && (uintptr_t) dst->src[2]->data % 4 == 0);
+    } else if constexpr (kv_fmt == FATTN_MMA_KV_F8_NVFP4) {
+        GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F8_E4M3 && dst->src[2]->type == GGML_TYPE_NVFP4);
+        GGML_ASSERT((uintptr_t) dst->src[1]->data % 8 == 0 && (uintptr_t) dst->src[2]->data % 4 == 0);
     }
     constexpr bool kv_conv = kv_fmt != FATTN_MMA_KV_F16;
 
@@ -3154,6 +3189,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #define DECL_FATTN_MMA_NVFP4_CASE(DKQ, DV, ncols1, ncols2)                                          \
     template void ggml_cuda_flash_attn_ext_mma_f16_case                                             \
     <DKQ, DV, ncols1, ncols2, FATTN_MMA_KV_NVFP4>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
+#define DECL_FATTN_MMA_F8_NVFP4_CASE(DKQ, DV, ncols1, ncols2)                                          \
+    template void ggml_cuda_flash_attn_ext_mma_f16_case                                                \
+    <DKQ, DV, ncols1, ncols2, FATTN_MMA_KV_F8_NVFP4>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
 #define DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(DKQ, DV, ncols)   \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 1,  1); \
@@ -3292,3 +3331,36 @@ extern DECL_FATTN_MMA_NVFP4_CASE(512, 512,  1,  8);
 extern DECL_FATTN_MMA_NVFP4_CASE(512, 512,  2,  8);
 extern DECL_FATTN_MMA_NVFP4_CASE(512, 512,  4,  8);
 extern DECL_FATTN_MMA_NVFP4_CASE(512, 512,  8,  8);
+
+// FP8 K + NVFP4 V read natively, same instances as NVFP4:
+#define DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2(DKQ, DV, ncols)   \
+    extern DECL_FATTN_MMA_F8_NVFP4_CASE(DKQ, DV, (ncols)/ 1,  1); \
+    extern DECL_FATTN_MMA_F8_NVFP4_CASE(DKQ, DV, (ncols)/ 2,  2); \
+    extern DECL_FATTN_MMA_F8_NVFP4_CASE(DKQ, DV, (ncols)/ 4,  4); \
+    extern DECL_FATTN_MMA_F8_NVFP4_CASE(DKQ, DV, (ncols)/ 8,  8); \
+
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2( 64,  64,  8)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2(128, 128,  8)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2(256, 256,  8)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2( 64,  64, 16)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2(128, 128, 16)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2(256, 256, 16)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2( 64,  64, 32)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2(128, 128, 32)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2(256, 256, 32)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2( 64,  64, 64)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2(128, 128, 64)
+DECL_FATTN_MMA_F8_NVFP4_CASE_ALL_NCOLS2(256, 256, 64)
+
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512,  4,  2);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512,  8,  2);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512, 16,  2);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512, 32,  2);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512,  2,  4);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512,  4,  4);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512,  8,  4);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512, 16,  4);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512,  1,  8);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512,  2,  8);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512,  4,  8);
+extern DECL_FATTN_MMA_F8_NVFP4_CASE(512, 512,  8,  8);
