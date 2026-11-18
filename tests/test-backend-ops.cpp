@@ -14091,6 +14091,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 114944,    1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 114944,    4, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
     }
+    // FP8 K + NVFP4 V: the same Gemma 4 shapes (global layers at 32K/112K, SWA decode)
+    {
+        const ggml_type k8 = GGML_TYPE_F8_E4M3, v4 = GGML_TYPE_NVFP4;
+        for (int kv : {34816, 116736}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, k8, v4));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 114944, 1, true, false, 0, 0, GGML_PREC_F32, k8, v4));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 114944, 4, true, false, 0, 0, GGML_PREC_F32, k8, v4));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 3328, 2048, true, false, 0, 0, GGML_PREC_F32, k8, v4));
+        for (int nb : {1, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 2048, nb, true, false, 0, 0, GGML_PREC_F32, k8, v4));
+        }
+    }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

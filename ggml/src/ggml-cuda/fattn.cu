@@ -177,7 +177,8 @@ static int ggml_cuda_fattn_mma_kv_native_fmt(const int cc, const ggml_tensor * d
     const ggml_tensor * V = dst->src[2];
 
     int fmt;
-    size_t align; // K/V row/head/sequence strides (and data) must be multiples of this
+    size_t align;   // K row/head/sequence strides (and data) must be multiples of this
+    size_t align_V; // same for V
     if (K->type == GGML_TYPE_F8_E4M3 && V->type == GGML_TYPE_F8_E4M3) {
         // A/B switch: GGML_CUDA_FA_FP8_CONVERT=1 restores the old behavior of converting FP8 K/V to f16 before the MMA kernel.
         static const bool force_convert = [] {
@@ -189,6 +190,7 @@ static int ggml_cuda_fattn_mma_kv_native_fmt(const int cc, const ggml_tensor * d
         }
         fmt   = FATTN_MMA_KV_F8;
         align = 8; // FP8 rows are read in 8 byte chunks
+        align_V = align;
     } else if (K->type == GGML_TYPE_NVFP4 && V->type == GGML_TYPE_NVFP4) {
         // A/B switch: GGML_CUDA_FA_NVFP4_CONVERT=1 converts NVFP4 K/V to f16 before the MMA kernel.
         static const bool force_convert = [] {
@@ -200,6 +202,19 @@ static int ggml_cuda_fattn_mma_kv_native_fmt(const int cc, const ggml_tensor * d
         }
         fmt   = FATTN_MMA_KV_NVFP4;
         align = sizeof(block_nvfp4); // strides in whole blocks, E2M1 data is read in 4 byte words
+        align_V = align;
+    } else if (K->type == GGML_TYPE_F8_E4M3 && V->type == GGML_TYPE_NVFP4) {
+        // GGML_CUDA_FA_NVFP4_CONVERT=1 also converts this pair to f16.
+        static const bool force_convert = [] {
+            const char * env = getenv("GGML_CUDA_FA_NVFP4_CONVERT");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (force_convert) {
+            return FATTN_MMA_KV_F16;
+        }
+        fmt     = FATTN_MMA_KV_F8_NVFP4;
+        align   = 8;
+        align_V = sizeof(block_nvfp4);
     } else {
         return FATTN_MMA_KV_F16;
     }
@@ -211,11 +226,14 @@ static int ggml_cuda_fattn_mma_kv_native_fmt(const int cc, const ggml_tensor * d
         return FATTN_MMA_KV_F16;
     }
     for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
-        if (K->nb[i] % align != 0 || V->nb[i] % align != 0) {
+        if (K->nb[i] % align != 0 || V->nb[i] % align_V != 0) {
             return FATTN_MMA_KV_F16;
         }
     }
     if (fmt == FATTN_MMA_KV_NVFP4 && ((uintptr_t) K->data % 4 != 0 || (uintptr_t) V->data % 4 != 0)) {
+        return FATTN_MMA_KV_F16;
+    }
+    if (fmt == FATTN_MMA_KV_F8_NVFP4 && ((uintptr_t) K->data % 8 != 0 || (uintptr_t) V->data % 4 != 0)) {
         return FATTN_MMA_KV_F16;
     }
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
@@ -384,6 +402,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 case 128: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, FATTN_MMA_KV_NVFP4>(ctx, dst); return;
                 case 256: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, FATTN_MMA_KV_NVFP4>(ctx, dst); return;
                 case 512: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512, FATTN_MMA_KV_NVFP4>(ctx, dst); return;
+                default:  GGML_ABORT("fatal error");
+            }
+        case FATTN_MMA_KV_F8_NVFP4:
+            switch (Q->ne[0]) {
+                case  64: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2< 64,  64, FATTN_MMA_KV_F8_NVFP4>(ctx, dst); return;
+                case 128: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, FATTN_MMA_KV_F8_NVFP4>(ctx, dst); return;
+                case 256: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, FATTN_MMA_KV_F8_NVFP4>(ctx, dst); return;
+                case 512: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512, FATTN_MMA_KV_F8_NVFP4>(ctx, dst); return;
                 default:  GGML_ABORT("fatal error");
             }
         default:
