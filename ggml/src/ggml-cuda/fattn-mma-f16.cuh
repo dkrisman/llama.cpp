@@ -1210,6 +1210,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
 
+    // The chunk pipeline, the FP4 ring and the L2 prefetch take the next KV block as kb0 + 1 (compile-time offset, the
+    //     kernel is at 255 registers): they only exist for single-stage kernels, which never rotate (kb0_next == kb0 + 1).
+    static_assert(!pipe || nstages <= 1, "chunk pipeline assumes no K/V block rotation");
     // FP4 tensor core path: start loading chunk c of this KV iteration (c >= nchunks: of the next one) into its ring slot,
     //     always commit a group so that the wait_group counts stay uniform. The mask of the next iteration goes with chunk
     //     nchunks_K + 3 (loaded at the first V chunk, after the softmax of this iteration).
@@ -1220,7 +1223,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (kv_tc) {
             char * const slot = (char *) tile_K + (c % fattn_mma_tc_nslots)*tc_slot_bytes;
             const int    cc   = c % nchunks_tc;
-            const int    kv0  = c < nchunks_tc ? k_VKQ_0 : kb0_next*nbatch_fa;
+            const int    kv0  = c < nchunks_tc ? k_VKQ_0 : k_VKQ_0 + nbatch_fa;
             if (c < nchunks_tc || !last_iter) {
                 if (cc < nchunks_K) {
                     fattn_mma_tc_load_chunk<nwarps, nbatch_fa>(slot, fattn_mma_kv_offset(K_h2, k0_start_first - cc*nbatch_K2), stride_K, kv0, indices);
@@ -1230,7 +1233,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
             if (c == nchunks_K + 3 && !last_iter) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
-                    (mask_h, tile_mask, stride_mask, kb0_next*nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
+                    (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
             }
             cp_async_commit_group();
         } else {
@@ -1291,8 +1294,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #ifndef GGML_CUDA_FA_NO_L2_PREFETCH
             // FP8 K + NVFP4 V: always (kv 34816 +0%, kv 116736 -21%); NVFP4 K/V: long K/V only; FP8 K/V: never.
             if (ic_K == 0 && !last_iter && !indices && ((k_f8 && v_nvfp4) || (k_nvfp4 && v_nvfp4 && l2_prefetch))) {
-                fattn_mma_prefetch_rows_l2<nwarps, nbatch_fa, DKQ>(K_h2, stride_K, kb0_next*nbatch_fa);
-                fattn_mma_prefetch_rows_l2<nwarps, nbatch_fa, DV >(V_h2, stride_V, kb0_next*nbatch_fa);
+                fattn_mma_prefetch_rows_l2<nwarps, nbatch_fa, DKQ>(K_h2, stride_K, k_VKQ_0 + nbatch_fa);
+                fattn_mma_prefetch_rows_l2<nwarps, nbatch_fa, DV >(V_h2, stride_V, k_VKQ_0 + nbatch_fa);
             }
 #endif // GGML_CUDA_FA_NO_L2_PREFETCH
             cp_async_wait_all(); // Current chunk (f16) and mask.
@@ -1785,8 +1788,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     pipe_load_chunk(stage, fattn_mma_kv_offset(V_h2, i0_stop/2), stride_V, k_VKQ_0, tile_KV_nxt);
                 } else if (!last_iter) {
                     flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
-                        (mask_h, tile_mask, stride_mask, kb0_next*nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
-                    pipe_load_chunk(stage_kn, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, kb0_next*nbatch_fa, tile_KV_nxt);
+                        (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
+                    pipe_load_chunk(stage_kn, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, k_VKQ_0 + nbatch_fa, tile_KV_nxt);
                 }
             }
         } else if constexpr (pipe) {
@@ -1797,8 +1800,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             } else if (!last_iter) {
                 // Prefetch mask and first K chunk of the next KV iteration, all warps are done with the softmax.
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, false, false>
-                    (mask_h, tile_mask, stride_mask, kb0_next*nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
-                pipe_load_chunk(stage_kn, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, kb0_next*nbatch_fa, tile_KV_nxt);
+                    (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, nbatch_fa, jt*ncols1, ne01, nullptr);
+                pipe_load_chunk(stage_kn, fattn_mma_kv_offset(K_h2, k0_start_first), stride_K, k_VKQ_0 + nbatch_fa, tile_KV_nxt);
             }
         } else if constexpr (nstages <= 1) {
             const int i0_diff = min(i0_stop, DV) - i0_start; // Only load the real head size from global memory.
@@ -3040,8 +3043,10 @@ static __global__ void flash_attn_ext_f16(
 
         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
         const T_K2   * K_h2   = (const T_K2   *) (K + nb13*sequence + nb12*z_KV);
+        // A mask with a head dimension (ne32 > 1) disables the GQA optimization (fattn.cu), so only ncols2 == 1 needs the
+        //     head offset; the GQA kernels skip it (in the D=512 chunk pipeline kernel the extra offset caused ~2 KB of spills).
         const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
-            (const half *) (mask + nb33*(sequence % ne33) + nb32*(zt_Q % ne32));
+            (const half *) (mask + nb33*(sequence % ne33) + (ncols2 == 1 ? nb32*(zt_Q % ne32) : 0));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
         const T_V2 * V_h2 = V_is_K_view ? (const T_V2 *) K_h2 : (const T_V2 *) (V + nb23*sequence + nb22*z_KV);
@@ -3095,7 +3100,7 @@ static __global__ void flash_attn_ext_f16(
     const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
     const T_K2   * K_h2   = (const T_K2   *) (K + nb13*sequence + nb12*z_KV);
     const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
-        (const half *) (mask + nb33*(sequence % ne33) + nb32*(zt_Q % ne32));
+        (const half *) (mask + nb33*(sequence % ne33) + (ncols2 == 1 ? nb32*(zt_Q % ne32) : 0));
     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
     const T_V2 * V_h2 = V_is_K_view ? (const T_V2 *) K_h2 : (const T_V2 *) (V + nb23*sequence + nb22*z_KV);
