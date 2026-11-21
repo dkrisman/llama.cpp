@@ -149,6 +149,25 @@ static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
 #endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
+// The wait above is an asm with a memory clobber, but loads through const __restrict__ pointers are compiled as invariant
+//     loads (LDG.CONSTANT) that can still be scheduled above it and then read inputs before the preceding kernel wrote them.
+//     Passing the pointers through an asm after the wait makes every load through them depend on it.
+template <typename T>
+static __device__ __forceinline__ void ggml_cuda_pdl_launder(T & ptr) {
+    static_assert(sizeof(T) == 8, "pointer expected");
+    asm volatile("" : "+l"(ptr));
+}
+
+template <typename... T>
+static __device__ __forceinline__ void ggml_cuda_pdl_sync(T &... ptrs) {
+    ggml_cuda_pdl_sync();
+#if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+    (ggml_cuda_pdl_launder(ptrs), ...);
+#else
+    GGML_UNUSED_VARS(ptrs...);
+#endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+}
+
 static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaTriggerProgrammaticLaunchCompletion();

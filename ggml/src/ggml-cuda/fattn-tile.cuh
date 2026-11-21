@@ -902,7 +902,7 @@ static __global__ void flash_attn_tile(
     }
     float KQ_sum[cpw] = {0.0f};
 
-    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_sync(Q_f, K_h2, V_h2, maskh, sinks, KV_max);
 
     // Load Q data, convert to FP16 if fast:
 #pragma unroll
